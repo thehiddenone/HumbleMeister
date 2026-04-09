@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+from typing import cast
+
 import torch
 import torch.nn as nn
 
@@ -19,7 +21,7 @@ class TokenEmbedding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: [batch_size, seq_len] — integer token IDs
         # output shape: [batch_size, seq_len, d_model]
-        return self.__embedding(x)
+        return cast(torch.Tensor, self.__embedding(x))
 
 
 class PositionalEncoding(nn.Module):
@@ -51,7 +53,7 @@ class PositionalEncoding(nn.Module):
         # x shape: [batch_size, seq_len, d_model]
         # self.pe[:, :seq_len] broadcasts across the batch dimension
         x = x + self.__pos_encoding[:, : x.size(1)]
-        return self.__dropout(x)
+        return cast(torch.Tensor, self.__dropout(x))
 
 
 class LearnedPositionalEncoding(nn.Module):
@@ -66,9 +68,9 @@ class LearnedPositionalEncoding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: [batch_size, seq_len, d_model]
         seq_len = x.size(1)
-        positions = torch.arange(seq_len, device=x.device)     # [seq_len]
-        pos_emb = self.__pos_embedding(positions)              # [seq_len, d_model]
-        return self.__dropout(x + pos_emb)                     # broadcasts over batch
+        positions = torch.arange(seq_len, device=x.device)  # [seq_len]
+        pos_emb = self.__pos_embedding(positions)  # [seq_len, d_model]
+        return cast(torch.Tensor, self.__dropout(x + pos_emb))  # broadcasts over batch
 
 
 class InputEmbedding(nn.Module):
@@ -80,15 +82,26 @@ class InputEmbedding(nn.Module):
     def token_embedding(self) -> TokenEmbedding:
         return self.__token_embedding
 
-    def __init__(self, vocab_size: int, d_model: int, max_seq_len: int = 512, dropout: float = 0.1, learned_pos_encoding = True) -> None:
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        max_seq_len: int = 512,
+        dropout: float = 0.1,
+        learned_pos_encoding: bool = True,
+    ) -> None:
         super().__init__()
         self.__token_embedding = TokenEmbedding(vocab_size, d_model)
-        self.__positional_encoding = LearnedPositionalEncoding(d_model, max_seq_len, dropout) if learned_pos_encoding else PositionalEncoding(d_model, max_seq_len, dropout)
+        self.__positional_encoding = (
+            LearnedPositionalEncoding(d_model, max_seq_len, dropout)
+            if learned_pos_encoding
+            else PositionalEncoding(d_model, max_seq_len, dropout)
+        )
         self.__d_model = d_model
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # scale embeddings by sqrt(d_model) — from the original transformer paper
         # this keeps the embedding values in a reasonable range relative to
         # the positional encoding values before adding them together
-        token_emb = self.__token_embedding(x) * math.sqrt(self.__d_model)
-        return self.__positional_encoding(token_emb)
+        token_emb = cast(torch.Tensor, self.__token_embedding(x)) * math.sqrt(self.__d_model)
+        return cast(torch.Tensor, self.__positional_encoding(token_emb))

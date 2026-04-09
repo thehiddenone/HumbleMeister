@@ -4,6 +4,6 @@ from ._trainer import (
 )
 
 __all__ = [
-    'ChessTrainer',
-    'ChessTrainingConfig',
+    "ChessTrainer",
+    "ChessTrainingConfig",
 ]

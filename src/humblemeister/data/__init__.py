@@ -6,8 +6,8 @@ from ._gamebank import ChessGameBank
 from ._tokenizer import ChessTokenizer
 
 __all__ = [
-    'ChessDataset',
-    'ChessGameBank',
-    'ChessTokenizer',
-    'GameRecord',
+    "ChessDataset",
+    "ChessGameBank",
+    "ChessTokenizer",
+    "GameRecord",
 ]

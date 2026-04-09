@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
+from typing import cast
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 
 class SingleHeadAttention(nn.Module):
@@ -46,7 +48,7 @@ class SingleHeadAttention(nn.Module):
 
         # weighted sum of values
         # [batch_size, seq_len, d_k]
-        out = weights @ V
+        out = cast(torch.Tensor, weights @ V)
 
         return out
 
@@ -60,12 +62,14 @@ def make_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
     # [seq_len, seq_len]
     return mask
 
+
 def make_padding_mask_bugged(attention_mask: torch.Tensor) -> torch.Tensor:
     # attention_mask: [batch, seq_len] — 1 for real tokens, 0 for padding
     # we need to broadcast to [batch, 1, 1, seq_len] so it combines with
     # the causal mask of shape [seq_len, seq_len]
     # result: [batch, 1, 1, seq_len] — 0.0 for real, -inf for padding
     return (1 - attention_mask).unsqueeze(1).unsqueeze(2) * float("-inf")
+
 
 def make_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
     # attention_mask: [batch, seq_len] — 1 for real tokens, 0 for padding

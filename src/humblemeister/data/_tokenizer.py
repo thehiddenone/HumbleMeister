@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import chess
-import torch
 from typing import Optional
 
+import chess
+import torch
 
-NEG_INF = float('-inf')
+NEG_INF = float("-inf")
+
 
 class ChessTokenizer:
     PAD = 0
@@ -37,15 +38,11 @@ class ChessTokenizer:
                 # only rank-7→rank-8 (white) or rank-2→rank-1 (black) can promote,
                 # and only if the file distance is at most 1 (straight or diagonal capture)
                 from_rank = chess.square_rank(from_sq)
-                to_rank   = chess.square_rank(to_sq)
+                to_rank = chess.square_rank(to_sq)
                 from_file = chess.square_file(from_sq)
-                to_file   = chess.square_file(to_sq)
-                is_promotion_square = (
-                    abs(from_file - to_file) <= 1
-                    and (
-                        (from_rank == 6 and to_rank == 7)
-                        or (from_rank == 1 and to_rank == 0)
-                    )
+                to_file = chess.square_file(to_sq)
+                is_promotion_square = abs(from_file - to_file) <= 1 and (
+                    (from_rank == 6 and to_rank == 7) or (from_rank == 1 and to_rank == 0)
                 )
                 if is_promotion_square:
                     for promo in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:

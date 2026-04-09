@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,7 +18,7 @@ class FeedForward(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: [batch, seq_len, d_model]
-        return self.linear2(self.dropout(F.gelu(self.linear1(x))))
+        return cast(torch.Tensor, self.linear2(self.dropout(F.gelu(self.linear1(x)))))
 
 
 class TransformerBlock(nn.Module):
@@ -28,11 +30,11 @@ class TransformerBlock(nn.Module):
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        self.attention   = MultiHeadAttention(d_model, n_heads, dropout)
+        self.attention = MultiHeadAttention(d_model, n_heads, dropout)
         self.feed_forward = FeedForward(d_model, d_ff, dropout)
-        self.norm1       = nn.LayerNorm(d_model)
-        self.norm2       = nn.LayerNorm(d_model)
-        self.dropout     = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(
         self,

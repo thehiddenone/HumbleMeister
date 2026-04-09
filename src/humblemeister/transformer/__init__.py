@@ -7,7 +7,7 @@ from ._transformer import (
 )
 
 __all__ = [
-    'ChessTransformer',
-    'FeedForward',
-    'TransformerBlock',
+    "ChessTransformer",
+    "FeedForward",
+    "TransformerBlock",
 ]

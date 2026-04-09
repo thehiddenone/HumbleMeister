@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from humblemeister.attention import KVCache, LayerKVCache, make_causal_mask
 from humblemeister.embedding import InputEmbedding
+
 from ._transformer import TransformerBlock
 
 
@@ -32,10 +33,9 @@ class ChessTransformer(nn.Module):
         super().__init__()
 
         self.__input_embedding = InputEmbedding(vocab_size, d_model, max_seq_len, dropout)
-        self.__blocks = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, d_ff, dropout)
-            for _ in range(n_layers)
-        ])
+        self.__blocks = nn.ModuleList(
+            [TransformerBlock(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)]
+        )
         self.__norm = nn.LayerNorm(d_model)
         self.__output = nn.Linear(d_model, vocab_size, bias=False)
         self.__value_head = nn.Sequential(
@@ -90,8 +90,8 @@ class ChessTransformer(nn.Module):
             out, _ = block(out, mask, kv_cache=None)  # discard cache during training
 
         hidden = self.__norm(out)
-        logits = self.output(hidden)                        # [batch, seq, vocab_size]
-        value  = self.__value_head(hidden).squeeze(-1)      # [batch, seq]
+        logits = self.output(hidden)  # [batch, seq, vocab_size]
+        value = self.__value_head(hidden).squeeze(-1)  # [batch, seq]
         return logits, value
 
     def generate_step(
@@ -112,7 +112,7 @@ class ChessTransformer(nn.Module):
             new_cache: updated KVCache with new K and V appended
         """
         # no mask needed — we're only attending to past tokens which are all valid
-        out      = self.__input_embedding(token)
+        out = self.__input_embedding(token)
         new_layers: list[LayerKVCache] = []
 
         for i, block in enumerate(self.__blocks):
@@ -122,5 +122,5 @@ class ChessTransformer(nn.Module):
 
         hidden = self.__norm(out)
         logits = self.output(hidden)
-        value  = self.__value_head(hidden).squeeze(-1)      # [batch, 1]
+        value = self.__value_head(hidden).squeeze(-1)  # [batch, 1]
         return logits, value, KVCache(layers=new_layers)

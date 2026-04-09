@@ -1,35 +1,32 @@
 from __future__ import annotations
 
-import chess
 import json
 import math
 import os
 import shutil
 import tempfile
 import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, cast
 
+import chess
 import safetensors.torch as st
 import torch
 import torch.nn.functional as F
-
-
-from dataclasses import asdict, dataclass
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from pathlib import Path
-from typing import cast
-
+from humblemeister.attention import KVCache, make_causal_mask, make_padding_mask
 from humblemeister.data import ChessDataset, ChessGameBank, ChessTokenizer, GameRecord
-from humblemeister.evaluation import StockfishEvaluator, compute_move_weights, AsyncBatchEvaluator
+from humblemeister.evaluation import AsyncBatchEvaluator, StockfishEvaluator, compute_move_weights
 from humblemeister.transformer import ChessTransformer
-from humblemeister.attention import make_causal_mask, make_padding_mask, KVCache
 
 
-def _save_temp_batch(batch: list[dict]) -> Path:
+def _save_temp_batch(batch: list[dict[str, Any]]) -> Path:
     """Write a list of game dicts to a temp file and return its path."""
     fd, path_str = tempfile.mkstemp(suffix=".pt", prefix="chess_sp_")
     os.close(fd)
@@ -40,15 +37,15 @@ def _save_temp_batch(batch: list[dict]) -> Path:
 
 def get_device() -> str:
     if torch.cuda.is_available():
-        return 'cuda'
+        return "cuda"
     if torch.mps.is_available():
-        return 'mps'
-    return 'cpu'
+        return "mps"
+    return "cpu"
 
 
 def get_scheduler(
-    optimizer:     torch.optim.Optimizer,
-    n_epochs:      int,
+    optimizer: torch.optim.Optimizer,
+    n_epochs: int,
     warmup_epochs: int,
 ) -> LambdaLR:
     def lr_lambda(epoch: int) -> float:
@@ -73,10 +70,10 @@ class ChessTrainingConfig:
 
     max_seq_len: int = 512
     dropout: float = 0.1
-    bf16: bool = True        # bfloat16 mixed precision — halves activation memory, no GradScaler needed
+    bf16: bool = True  # bfloat16 mixed precision — halves activation memory, no GradScaler needed
 
     # training
-    n_games: int = 512        # total games loaded per epoch
+    n_games: int = 512  # total games loaded per epoch
     n_epochs: int = 2000
     lr: float = 3e-4
     device: str = get_device()
@@ -86,22 +83,22 @@ class ChessTrainingConfig:
     outcome_warmup: int = 20000
 
     # self-play curriculum — ramps in gradually after self_play_start_epoch
-    self_play_start_epoch: int   = 1000  # all bank games before this
-    self_play_ramp_epochs: int   = 200   # epochs to ramp from 0% → max ratio
-    self_play_max_ratio:   float = 0.3   # cap at 30% self-play games
-    self_play_batch_size:  int   = 64    # games per generation sub-batch (bounds KV-cache VRAM)
+    self_play_start_epoch: int = 1000  # all bank games before this
+    self_play_ramp_epochs: int = 200  # epochs to ramp from 0% → max ratio
+    self_play_max_ratio: float = 0.3  # cap at 30% self-play games
+    self_play_batch_size: int = 64  # games per generation sub-batch (bounds KV-cache VRAM)
 
     # stockfish evaluation
-    use_stockfish:          bool  = True
-    stockfish_path:         str   = "stockfish"
-    stockfish_depth:        int   = 5      # depth 5 ≈ 1-5ms/position
-    stockfish_workers:      int   = 4      # parallel engine processes for board evaluation
-    advantage_temperature:  float = 1.0   # sharpness of per-move weight distribution
+    use_stockfish: bool = True
+    stockfish_path: str = "stockfish"
+    stockfish_depth: int = 5  # depth 5 ≈ 1-5ms/position
+    stockfish_workers: int = 4  # parallel engine processes for board evaluation
+    advantage_temperature: float = 1.0  # sharpness of per-move weight distribution
 
     # checkpointing
     checkpoint_dir: str = "env/checkpoints"
-    checkpoint_every: int = 50     # save every N epochs
-    keep_last_n: int = 5           # keep only the last N checkpoints
+    checkpoint_every: int = 50  # save every N epochs
+    keep_last_n: int = 5  # keep only the last N checkpoints
 
     # logging
     log_dir: str = "env/logs"
@@ -183,7 +180,7 @@ class ChessTrainingConfig:
         return result
 
     def save(self, file_path: str | Path) -> None:
-        with Path(file_path).open(mode = 'w') as f:
+        with Path(file_path).open(mode="w") as f:
             json.dump(asdict(self), f)
 
     @classmethod
@@ -191,11 +188,13 @@ class ChessTrainingConfig:
         with Path(file_path).open() as f:
             d = json.load(f)
             if not isinstance(d, dict):
-                raise TypeError(f'Cannot load ChessTrainingConfig: expected dict, got {type(d).__name__}')
-            if 'model_name' not in d:
-                raise ValueError(f'Cannot load ChessTrainingConfig: model_name is not defined')
-            model_name = d['model_name']
-            del d['model_name']
+                raise TypeError(
+                    f"Cannot load ChessTrainingConfig: expected dict, got {type(d).__name__}"
+                )
+            if "model_name" not in d:
+                raise ValueError(f"Cannot load ChessTrainingConfig: model_name is not defined")
+            model_name = d["model_name"]
+            del d["model_name"]
             return cls(model_name, **d)
 
 
@@ -210,28 +209,34 @@ class ChessTrainer:
     __gamebank: ChessGameBank
     __start_epoch: int
 
-    def __init__(self, config: ChessTrainingConfig, game_bank: ChessGameBank, resume: bool = False) -> None:
+    def __init__(
+        self, config: ChessTrainingConfig, game_bank: ChessGameBank, resume: bool = False
+    ) -> None:
         self.__config = config
         self.__device = torch.device(config.device)
         self.__start_epoch = 0
         self.__tokenizer = ChessTokenizer()
         self.__dataset = ChessDataset(self.__tokenizer)
         self.__gamebank = game_bank
-        self.__evaluator = StockfishEvaluator(config.stockfish_path, config.stockfish_workers) if config.use_stockfish else None
+        self.__evaluator = (
+            StockfishEvaluator(config.stockfish_path, config.stockfish_workers)
+            if config.use_stockfish
+            else None
+        )
 
         self.__model = ChessTransformer(
-            vocab_size  = self.__tokenizer.vocab_size,
-            d_model = config.d_model,
-            n_heads = config.n_heads,
-            n_layers = config.n_layers,
-            d_ff = config.d_ff,
-            max_seq_len = config.max_seq_len,
-            dropout = config.dropout,
+            vocab_size=self.__tokenizer.vocab_size,
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            n_layers=config.n_layers,
+            d_ff=config.d_ff,
+            max_seq_len=config.max_seq_len,
+            dropout=config.dropout,
         ).to(self.__device)
 
         self.__optimizer = AdamW(self.__model.parameters(), lr=config.lr, weight_decay=0.1)
         self.__scheduler = get_scheduler(self.__optimizer, config.n_epochs, config.warmup_epochs)
-    
+
         if resume:
             self.__load_latest_checkpoint()
         else:
@@ -248,17 +253,20 @@ class ChessTrainer:
             # save weights as safetensors
             st.save_model(self.__model, f"{path}/model.safetensors")
 
-            # save config separately as json — safetensors only stores tensors
+            # save config
             with open(f"{path}/config.json", "w") as f:
                 json.dump(vars(self.__config), f, indent=2)
 
             print(f"model saved as safetensors to {path}/")
         else:
-            torch.save({
-                "model_state": self.__model.state_dict(),
-                "config": self.__config,
-                "vocab_size": self.__tokenizer.vocab_size,
-            }, path)
+            torch.save(
+                {
+                    "model_state": self.__model.state_dict(),
+                    "config": self.__config,
+                    "vocab_size": self.__tokenizer.vocab_size,
+                },
+                path,
+            )
             print(f"model saved as pt: {path}")
 
     @property
@@ -275,10 +283,13 @@ class ChessTrainer:
         0.0 before self_play_start_epoch, then linearly ramps to self_play_max_ratio
         over self_play_ramp_epochs, and stays there.
         """
-        cfg      = self.__config
+        cfg = self.__config
         progress = (epoch - cfg.self_play_start_epoch) / max(cfg.self_play_ramp_epochs, 1)
-        return float(min(cfg.self_play_max_ratio, cfg.self_play_max_ratio * progress)) \
-            if epoch >= cfg.self_play_start_epoch else 0.0
+        return (
+            float(min(cfg.self_play_max_ratio, cfg.self_play_max_ratio * progress))
+            if epoch >= cfg.self_play_start_epoch
+            else 0.0
+        )
 
     def generate_games(self, epoch: int) -> float:
         """
@@ -287,18 +298,18 @@ class ChessTrainer:
         """
         self.__model.eval()
         self.__dataset.clear()
-        self.__eval_time_ms  = 0.0  # cumulative Stockfish wall time this epoch
+        self.__eval_time_ms = 0.0  # cumulative Stockfish wall time this epoch
         self.__eval_game_count = 0  # number of games evaluated
 
-        ratio         = self._self_play_ratio(epoch)
-        n_self_play   = int(self.__config.n_games * ratio)
-        n_bank        = self.__config.n_games - n_self_play
+        ratio = self._self_play_ratio(epoch)
+        n_self_play = int(self.__config.n_games * ratio)
+        n_bank = self.__config.n_games - n_self_play
 
         # bank games
         while len(self.__dataset) < n_bank:
             self.__generate_from_bank(n_bank)
 
-        # self-play games (skipped entirely before the curriculum kicks in)
+        # self-play games
         if n_self_play > 0:
             self.__generate_self_play(n_self_play)
 
@@ -313,12 +324,16 @@ class ChessTrainer:
             # validate all moves are in tokenizer vocabulary
             try:
                 if len(moves) > self.__config.max_moves:
-                    print(f"  skipping game: too many moves {len(moves)} > {self.__config.max_moves}")
+                    print(
+                        f"  skipping game: too many moves {len(moves)} > {self.__config.max_moves}"
+                    )
                     continue
 
                 tensor = self.__tokenizer.encode_game_tensor(moves)
                 if tensor.max().item() >= self.__tokenizer.vocab_size:
-                    print(f"  skipping game: token ID {tensor.max().item()} >= vocab_size {self.__tokenizer.vocab_size}")
+                    print(
+                        f"  skipping game: token ID {tensor.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
+                    )
                     continue
                 if tensor.min().item() < 0:
                     print(f"  skipping game: negative token ID {tensor.min().item()}")
@@ -332,29 +347,32 @@ class ChessTrainer:
             if weights is None and self.__evaluator is not None:
                 t0 = time.perf_counter()
                 weights = compute_move_weights(
-                    moves, self.__evaluator,
+                    moves,
+                    self.__evaluator,
                     self.__config.stockfish_depth,
                     self.__config.advantage_temperature,
                 )
-                self.__eval_time_ms   += (time.perf_counter() - t0) * 1000
+                self.__eval_time_ms += (time.perf_counter() - t0) * 1000
                 self.__eval_game_count += 1
 
-            self.__dataset.add_game(GameRecord(
-                moves        = moves,
-                outcome      = outcome,
-                tensor       = tensor,
-                move_weights = weights,
-                value_evals  = value_evals,
-            ))
+            self.__dataset.add_game(
+                GameRecord(
+                    moves=moves,
+                    outcome=outcome,
+                    tensor=tensor,
+                    move_weights=weights,
+                    value_evals=value_evals,
+                )
+            )
 
-    def __generation_round(self, n: int) -> list[dict]:
+    def __generation_round(self, n: int) -> list[dict[str, Any]]:
         """Generate n self-play games. Returns raw game dicts with no weights."""
         boards = [chess.Board() for _ in range(n)]
         move_history = [[self.__tokenizer.BOS] for _ in range(n)]
         kv_caches = [KVCache() for _ in range(n)]
         active = list(range(n))  # indices of unfinished games
         max_moves = self.__config.max_moves
-        results: list[dict] = []
+        results: list[dict[str, Any]] = []
 
         with torch.no_grad():
             while active:
@@ -375,8 +393,8 @@ class ChessTrainer:
                         token,
                         kv_caches[game_idx],
                     )
-                    next_logits_list.append(logits[0, 0])        # [vocab_size]
-                    kv_caches[game_idx] = new_cache              # free old cache immediately
+                    next_logits_list.append(logits[0, 0])  # [vocab_size]
+                    kv_caches[game_idx] = new_cache  # free old cache immediately
 
                 still_active = []
                 for idx, game_idx in enumerate(active):
@@ -394,7 +412,7 @@ class ChessTrainer:
 
                     move = self.__tokenizer.decode_move(int(token_id))
                     if move is None:
-                        raise RuntimeError(f'unexpected move: {move}')
+                        raise RuntimeError(f"unexpected move: {move}")
 
                     board.push(move)
                     move_history[game_idx].append(int(token_id))
@@ -411,17 +429,18 @@ class ChessTrainer:
 
         return results
 
-    def __extract_game(self, board: chess.Board, token_history: list[int]) -> dict | None:
+    def __extract_game(self, board: chess.Board, token_history: list[int]) -> dict[str, Any] | None:
         """Extract a completed self-play game into a serialisable dict, or None if invalid."""
-        result  = board.result()  # "1-0", "0-1", "1/2-1/2", or "*" if max_moves reached
+        result = board.result()  # "1-0", "0-1", "1/2-1/2", or "*" if max_moves reached
         outcome = {"1-0": 1.0, "0-1": 0.0, "1/2-1/2": 0.5}.get(result, 0.5)
 
-        moves = [
-            self.__tokenizer.decode_move(t)
+        moves: list[chess.Move] = [
+            m
             for t in token_history
             if t not in (self.__tokenizer.BOS, self.__tokenizer.EOS, self.__tokenizer.PAD)
+            for m in (self.__tokenizer.decode_move(t),)
+            if m is not None
         ]
-        moves = [m for m in moves if m is not None]
 
         if len(moves) > self.__config.max_moves:
             return None
@@ -430,7 +449,7 @@ class ChessTrainer:
 
     def __add_batch_to_dataset(self, batch_path: Path) -> None:
         """Load an evaluated batch from a temp file, add games to the dataset, delete the file."""
-        data: list[dict] = torch.load(batch_path, weights_only=False)
+        data: list[dict[str, Any]] = torch.load(batch_path, weights_only=False)
         batch_path.unlink()
 
         for item in data:
@@ -441,12 +460,14 @@ class ChessTrainer:
             except Exception:
                 continue
 
-            self.__dataset.add_game(GameRecord(
-                moves        = moves,
-                outcome      = float(item["outcome"]),
-                tensor       = tensor,
-                move_weights = item.get("weights"),
-            ))
+            self.__dataset.add_game(
+                GameRecord(
+                    moves=moves,
+                    outcome=float(item["outcome"]),
+                    tensor=tensor,
+                    move_weights=item.get("weights"),
+                )
+            )
 
     def __generate_self_play(self, n_self_play: int) -> None:
         """
@@ -457,12 +478,16 @@ class ChessTrainer:
         The number of concurrent forks is capped at stockfish_workers.
         """
         batch_size = self.__config.self_play_batch_size
-        evaluator  = AsyncBatchEvaluator(
-            stockfish_path = self.__config.stockfish_path,
-            depth          = self.__config.stockfish_depth,
-            temperature    = self.__config.advantage_temperature,
-            n_workers      = self.__config.stockfish_workers,
-        ) if self.__config.use_stockfish else None
+        evaluator = (
+            AsyncBatchEvaluator(
+                stockfish_path=self.__config.stockfish_path,
+                depth=self.__config.stockfish_depth,
+                temperature=self.__config.advantage_temperature,
+                n_workers=self.__config.stockfish_workers,
+            )
+            if self.__config.use_stockfish
+            else None
+        )
 
         generated = 0
         try:
@@ -483,14 +508,16 @@ class ChessTrainer:
                     # no Stockfish — add directly with no weights
                     for item in batch:
                         try:
-                            moves  = [chess.Move.from_uci(uci) for uci in item["moves"]]
+                            moves = [chess.Move.from_uci(uci) for uci in item["moves"]]
                             tensor = self.__tokenizer.encode_game_tensor(moves)
-                            self.__dataset.add_game(GameRecord(
-                                moves        = moves,
-                                outcome      = float(item["outcome"]),
-                                tensor       = tensor,
-                                move_weights = None,
-                            ))
+                            self.__dataset.add_game(
+                                GameRecord(
+                                    moves=moves,
+                                    outcome=float(item["outcome"]),
+                                    tensor=tensor,
+                                    move_weights=None,
+                                )
+                            )
                         except Exception:
                             continue
 
@@ -516,23 +543,23 @@ class ChessTrainer:
 
         dataloader = DataLoader(
             self.__dataset,
-            batch_size = batch_size,
-            shuffle    = True,
-            collate_fn = self.__dataset.collate,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=self.__dataset.collate,
         )
 
         # outcome weighting only applies when self-play games are present — those games
         # were generated by the model itself, so we can reinforce winning patterns.
         # bank games are worth learning from equally regardless of outcome.
         if self_play_ratio > 0.0:
-            outcome_scale   = min(1.0, epoch / max(self.__config.outcome_warmup, 1))
-            outcomes        = torch.tensor(
-                [g.outcome for g in self.__dataset.games],  # type: ignore
+            outcome_scale = min(1.0, epoch / max(self.__config.outcome_warmup, 1))
+            outcomes = torch.tensor(
+                [g.outcome for g in self.__dataset.games],
                 device=self.__device,
             )
             outcome_weights = (outcomes * 2 - 1).mean()  # [-1, +1]
         else:
-            outcome_scale   = 0.0
+            outcome_scale = 0.0
             outcome_weights = torch.tensor(0.0, device=self.__device)
 
         total_loss = 0.0
@@ -540,22 +567,23 @@ class ChessTrainer:
         self.__optimizer.zero_grad()
 
         for batch in dataloader:
-            input_ids      = cast(torch.Tensor, batch["input_ids"]).to(self.__device)
-            targets        = cast(torch.Tensor, batch["targets"]).to(self.__device)
+            input_ids = cast(torch.Tensor, batch["input_ids"]).to(self.__device)
+            targets = cast(torch.Tensor, batch["targets"]).to(self.__device)
             attention_mask = cast(torch.Tensor, batch["attention_mask"]).to(self.__device)
 
-            causal_mask   = make_causal_mask(input_ids.size(1), self.__device)
-            padding_mask  = make_padding_mask(attention_mask).to(self.__device)
+            causal_mask = make_causal_mask(input_ids.size(1), self.__device)
+            padding_mask = make_padding_mask(attention_mask).to(self.__device)
             combined_mask = causal_mask + padding_mask
 
-            assert input_ids.max().item() < self.__tokenizer.vocab_size, \
-                f"token ID {input_ids.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
-            assert input_ids.min().item() >= 0, \
-                f"negative token ID {input_ids.min().item()}"
-            assert targets.max().item() < self.__tokenizer.vocab_size, \
-                f"target token ID {targets.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
+            assert (
+                input_ids.max().item() < self.__tokenizer.vocab_size
+            ), f"token ID {input_ids.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
+            assert input_ids.min().item() >= 0, f"negative token ID {input_ids.min().item()}"
+            assert (
+                targets.max().item() < self.__tokenizer.vocab_size
+            ), f"target token ID {targets.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
 
-            move_weights   = cast(torch.Tensor, batch["move_weights"]).to(self.__device)
+            move_weights = cast(torch.Tensor, batch["move_weights"]).to(self.__device)
 
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
                 logits, _ = self.__model(input_ids, combined_mask)
@@ -563,15 +591,15 @@ class ChessTrainer:
                 per_token_loss = F.cross_entropy(
                     logits.view(-1, self.__tokenizer.vocab_size),
                     targets.view(-1),
-                    ignore_index    = self.__tokenizer.PAD,
-                    label_smoothing = 0.1,
-                    reduction       = "none",
+                    ignore_index=self.__tokenizer.PAD,
+                    label_smoothing=0.1,
+                    reduction="none",
                 )  # [batch * seq_len]
 
-                pad_mask     = (targets.view(-1) != self.__tokenizer.PAD).float()
+                pad_mask = (targets.view(-1) != self.__tokenizer.PAD).float()
                 weights_flat = move_weights.view(-1)
-                denom        = pad_mask.sum().clamp(min=1)
-                loss         = (per_token_loss * weights_flat * pad_mask).sum() / denom
+                denom = pad_mask.sum().clamp(min=1)
+                loss = (per_token_loss * weights_flat * pad_mask).sum() / denom
 
             if torch.isnan(loss) or torch.isinf(loss):
                 print("warning: NaN/inf loss detected, skipping mini-batch")
@@ -582,7 +610,7 @@ class ChessTrainer:
 
             # scale gradient by 1/n_batches so the effective update equals
             # the average loss across all mini-batches
-            (scaled_loss / n_batches).backward()
+            (scaled_loss / n_batches).backward()  # type: ignore[no-untyped-call]
 
             total_loss += scaled_loss.item()
 
@@ -597,11 +625,7 @@ class ChessTrainer:
                 print(f"  bad weight: {name} nan={torch.isnan(p).any()} inf={torch.isinf(p).any()}")
 
         # check gradients for NaN before stepping
-        if any(
-            torch.isnan(p.grad).any()
-            for p in self.__model.parameters()
-            if p.grad is not None
-        ):
+        if any(torch.isnan(p.grad).any() for p in self.__model.parameters() if p.grad is not None):
             print("warning: NaN gradients detected, skipping update")
             self.__optimizer.zero_grad()
             return total_loss, False
@@ -626,10 +650,7 @@ class ChessTrainer:
         Games without value_evals are silently skipped.
         """
         # freeze everything except the value head
-        value_params = [
-            p for name, p in self.__model.named_parameters()
-            if "value_head" in name
-        ]
+        value_params = [p for name, p in self.__model.named_parameters() if "value_head" in name]
         for p in self.__model.parameters():
             p.requires_grad = False
         for p in value_params:
@@ -637,7 +658,9 @@ class ChessTrainer:
 
         optimizer = AdamW(value_params, lr=lr)
 
-        print(f"pretraining value head — {sum(p.numel() for p in value_params):,} params, {n_epochs} epochs")
+        print(
+            f"pretraining value head — {sum(p.numel() for p in value_params):,} params, {n_epochs} epochs"
+        )
 
         self.__model.train()
 
@@ -648,30 +671,32 @@ class ChessTrainer:
             # skip epoch if no games have value evals
             games_with_evals = [g for g in self.__dataset.games if g.value_evals is not None]
             if not games_with_evals:
-                print(f"  epoch {epoch}: no value_evals in bank — skipping (run evaluate_moves first)")
+                print(
+                    f"  epoch {epoch}: no value_evals in bank — skipping (run evaluate_moves first)"
+                )
                 break
 
             dataloader = DataLoader(
                 self.__dataset,
-                batch_size = min(self.__config.train_batch_size, len(self.__dataset)),
-                shuffle    = True,
-                collate_fn = self.__dataset.collate,
+                batch_size=min(self.__config.train_batch_size, len(self.__dataset)),
+                shuffle=True,
+                collate_fn=self.__dataset.collate,
             )
 
             total_loss = 0.0
-            n_batches  = 0
+            n_batches = 0
 
             for batch in dataloader:
-                input_ids      = cast(torch.Tensor, batch["input_ids"]).to(self.__device)
+                input_ids = cast(torch.Tensor, batch["input_ids"]).to(self.__device)
                 attention_mask = cast(torch.Tensor, batch["attention_mask"]).to(self.__device)
-                value_targets  = cast(torch.Tensor, batch["value_evals"]).to(self.__device)
-                has_evals      = cast(torch.Tensor, batch["has_value_evals"]).to(self.__device)
+                value_targets = cast(torch.Tensor, batch["value_evals"]).to(self.__device)
+                has_evals = cast(torch.Tensor, batch["has_value_evals"]).to(self.__device)
 
                 # skip batch if no game has real evals
                 if not has_evals.any():
                     continue
 
-                causal_mask  = make_causal_mask(input_ids.size(1), self.__device)
+                causal_mask = make_causal_mask(input_ids.size(1), self.__device)
                 padding_mask = make_padding_mask(attention_mask).to(self.__device)
 
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
@@ -688,13 +713,13 @@ class ChessTrainer:
                 if torch.isnan(loss) or torch.isinf(loss):
                     continue
 
-                loss.backward()
+                loss.backward()  # type: ignore[no-untyped-call]
                 torch.nn.utils.clip_grad_norm_(value_params, max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
 
                 total_loss += loss.item()
-                n_batches  += 1
+                n_batches += 1
 
             avg_loss = total_loss / max(n_batches, 1)
             self.writer.add_scalar("value_pretrain/loss", avg_loss, epoch)
@@ -735,8 +760,8 @@ class ChessTrainer:
 
             self.__scheduler.step()
 
-            epoch_s      = time.perf_counter() - epoch_start
-            eval_ms      = self.__eval_time_ms / max(self.__eval_game_count, 1)
+            epoch_s = time.perf_counter() - epoch_start
+            eval_ms = self.__eval_time_ms / max(self.__eval_game_count, 1)
 
             if epoch % self.__config.log_every == 0:
                 self.__log(epoch, loss, self_play_ratio, epoch_s, eval_ms)
@@ -752,43 +777,36 @@ class ChessTrainer:
         self.writer.close()
         if self.__evaluator is not None:
             self.__evaluator.close()
-        self.save_model(Path('.') / 'env' / 'out' / self.__config.model_name)
+        self.save_model(Path(".") / "env" / "out" / self.__config.model_name)
 
     #
     # Logging
     #
 
-    def __log(self, epoch: int, loss: float, self_play_ratio: float, epoch_s: float, eval_ms: float) -> None:
-        games    = self.__dataset.games
-        n_games  = len(games)
+    def __log(
+        self, epoch: int, loss: float, self_play_ratio: float, epoch_s: float, eval_ms: float
+    ) -> None:
+        games = self.__dataset.games
+        n_games = len(games)
         outcomes = [g.outcome for g in games]
-        lengths  = [len(g.moves) for g in games]
+        lengths = [len(g.moves) for g in games]
 
-        avg_len   = sum(lengths)  / max(n_games, 1)
-        win_rate  = sum(1 for o in outcomes if o == 1.0) / max(n_games, 1)
+        avg_len = sum(lengths) / max(n_games, 1)
+        win_rate = sum(1 for o in outcomes if o == 1.0) / max(n_games, 1)
         draw_rate = sum(1 for o in outcomes if o == 0.5) / max(n_games, 1)
         loss_rate = sum(1 for o in outcomes if o == 0.0) / max(n_games, 1)
         current_lr = self.__optimizer.param_groups[0]["lr"]
 
         # tensorboard
-        self.writer.add_scalar("loss/train",             loss,             epoch)
-        self.writer.add_scalar("games/avg_length",       avg_len,          epoch)
-        self.writer.add_scalar("games/win_rate",         win_rate,         epoch)
-        self.writer.add_scalar("games/draw_rate",        draw_rate,        epoch)
-        self.writer.add_scalar("games/loss_rate",        loss_rate,        epoch)
-        self.writer.add_scalar("curriculum/self_play",   self_play_ratio,  epoch)
-        self.writer.add_scalar("lr",                     current_lr,       epoch)
-        self.writer.add_scalar("perf/epoch_s",           epoch_s,          epoch)
-        self.writer.add_scalar("perf/eval_ms_per_game",  eval_ms,          epoch)
-
-        # stdout
-        # print(
-        #     f"epoch {epoch:4d} | "
-        #     f"loss {loss:.4f} | "
-        #     f"lr {current_lr:.2e} | "
-        #     f"avg moves {avg_len:.1f} | "
-        #     f"W/D/L {win_rate:.2f}/{draw_rate:.2f}/{loss_rate:.2f}"
-        # )
+        self.writer.add_scalar("loss/train", loss, epoch)
+        self.writer.add_scalar("games/avg_length", avg_len, epoch)
+        self.writer.add_scalar("games/win_rate", win_rate, epoch)
+        self.writer.add_scalar("games/draw_rate", draw_rate, epoch)
+        self.writer.add_scalar("games/loss_rate", loss_rate, epoch)
+        self.writer.add_scalar("curriculum/self_play", self_play_ratio, epoch)
+        self.writer.add_scalar("lr", current_lr, epoch)
+        self.writer.add_scalar("perf/epoch_s", epoch_s, epoch)
+        self.writer.add_scalar("perf/eval_ms_per_game", eval_ms, epoch)
 
     #
     # Checkpointing
@@ -799,13 +817,16 @@ class ChessTrainer:
 
     def __save_checkpoint(self, epoch: int, loss: float) -> None:
         path = self.__get_checkpoint_path(epoch)
-        torch.save({
-            "epoch":           epoch,
-            "model_state":     self.__model.state_dict(),
-            "optimizer_state": self.__optimizer.state_dict(),
-            "scheduler_state": self.__scheduler.state_dict(),
-            "loss":            loss,
-        }, path)
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state": self.__model.state_dict(),
+                "optimizer_state": self.__optimizer.state_dict(),
+                "scheduler_state": self.__scheduler.state_dict(),
+                "loss": loss,
+            },
+            path,
+        )
         self.__prune_checkpoints()
 
     def __prune_checkpoints(self) -> None:
@@ -827,8 +848,9 @@ class ChessTrainer:
         self.__scheduler.load_state_dict(checkpoint["scheduler_state"])
         self.__start_epoch = checkpoint["epoch"] + 1
 
-        print(f"resumed from {path.name} (epoch {checkpoint['epoch']}, loss {checkpoint['loss']:.4f})")
-
+        print(
+            f"resumed from {path.name} (epoch {checkpoint['epoch']}, loss {checkpoint['loss']:.4f})"
+        )
 
     def _check_tensors(self, label: str, **tensors: torch.Tensor) -> bool:
         """Returns True if any tensor contains NaN or inf."""
@@ -837,6 +859,8 @@ class ChessTrainer:
             has_nan = torch.isnan(t).any().item()
             has_inf = torch.isinf(t).any().item()
             if has_nan or has_inf:
-                print(f"  {label} — {name}: nan={has_nan} inf={has_inf} min={t.min():.4f} max={t.max():.4f}")
+                print(
+                    f"  {label} — {name}: nan={has_nan} inf={has_inf} min={t.min():.4f} max={t.max():.4f}"
+                )
                 found = True
         return found

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from typing import cast
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from dataclasses import dataclass, field
 
 from ._single_head import SingleHeadAttention
 
@@ -18,6 +19,7 @@ class LayerKVCache:
 @dataclass
 class KVCache:
     """One LayerKVCache per transformer block."""
+
     layers: list[LayerKVCache] = field(default_factory=list)
 
     def is_empty(self) -> bool:
@@ -32,10 +34,7 @@ class SlowMultiHeadAttention(nn.Module):
         self.n_heads = n_heads
         self.d_k = d_model // n_heads  # each head works on a slice of d_model
 
-        self.heads = nn.ModuleList([
-            SingleHeadAttention(d_model, self.d_k)
-            for _ in range(n_heads)
-        ])
+        self.heads = nn.ModuleList([SingleHeadAttention(d_model, self.d_k) for _ in range(n_heads)])
 
         # final projection back to d_model after concatenating heads
         self.W_o = nn.Linear(d_model, d_model, bias=False)
@@ -52,7 +51,7 @@ class SlowMultiHeadAttention(nn.Module):
         concat = torch.cat(head_outputs, dim=-1)
 
         # final linear projection
-        return self.W_o(concat)
+        return cast(torch.Tensor, self.W_o(concat))
 
 
 class MultiHeadAttention(nn.Module):
@@ -102,9 +101,11 @@ class MultiHeadAttention(nn.Module):
 
         # Flash Attention — never materialises the [batch, heads, seq, seq] matrix
         out = F.scaled_dot_product_attention(
-            Q, K, V,
-            attn_mask   = mask,
-            dropout_p   = self.dropout.p if self.training else 0.0,
+            Q,
+            K,
+            V,
+            attn_mask=mask,
+            dropout_p=self.dropout.p if self.training else 0.0,
         )
 
         # merge heads back — transpose → [batch, seq_len, n_heads, d_k]

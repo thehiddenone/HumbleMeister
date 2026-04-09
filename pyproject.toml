@@ -33,7 +33,7 @@ target-version = ["py312"]
 [tool.isort]
 profile = "black"
 line_length = 100
-force_trailing_comma = true
+include_trailing_comma = true
 src_paths = ["src"]
 py_version = 312
 
@@ -47,3 +47,7 @@ files = ["src/"]
 format = ["isort src/", "black src/"]
 typecheck = "mypy src/"
 check = ["format", "typecheck"]
+
+[tool.hatch.envs.default]
+type = "virtual"
+path = ".venv"

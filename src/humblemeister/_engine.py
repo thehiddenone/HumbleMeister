@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-import torch
-import torch.nn.functional as F
-import chess
-import chess.svg
 import json
 from pathlib import Path
 from typing import overload
 
+import chess
+import chess.svg
+import torch
+import torch.nn.functional as F
+
 from .attention import make_causal_mask
 from .data import ChessTokenizer
-from .transformer import ChessTransformer
 from .trainer import ChessTrainingConfig
+from .transformer import ChessTransformer
 
 
 class ChessEngine:
@@ -22,12 +23,12 @@ class ChessEngine:
         device: str = "cpu",
         temperature: float = 1.0,
     ) -> None:
-        self.model        = model.to(device)
-        self.tokenizer    = tokenizer
-        self.device       = torch.device(device)
-        self.temperature  = temperature
+        self.model = model.to(device)
+        self.tokenizer = tokenizer
+        self.device = torch.device(device)
+        self.temperature = temperature
         self.player_color: chess.Color | None = None
-        self.board        = chess.Board()
+        self.board = chess.Board()
         self.move_history: list[int] = [self.tokenizer.BOS]
 
         self.model.eval()
@@ -48,8 +49,8 @@ class ChessEngine:
         with open(f"{path}/config.json") as f:
             config = ChessTrainingConfig(**json.load(f))
 
-        tokenizer  = ChessTokenizer()
-        model      = cls._build_model(config, tokenizer)
+        tokenizer = ChessTokenizer()
+        model = cls._build_model(config, tokenizer)
         state_dict = load_file(f"{path}/model.safetensors", device=device)
 
         # __output.weight is tied to the embedding weight and deduped by safetensors —
@@ -57,8 +58,7 @@ class ChessEngine:
         # the embedding tensor in-place also updates __output.weight (same object)
         incompatible = model.load_state_dict(state_dict, strict=False)
         unexpected_missing = [
-            k for k in incompatible.missing_keys
-            if k != "_ChessTransformer__output.weight"
+            k for k in incompatible.missing_keys if k != "_ChessTransformer__output.weight"
         ]
         if unexpected_missing or incompatible.unexpected_keys:
             raise RuntimeError(
@@ -76,9 +76,9 @@ class ChessEngine:
         temperature: float = 1.0,
     ) -> ChessEngine:
         checkpoint = torch.load(path, map_location=device)
-        config     = checkpoint["config"]
-        tokenizer  = ChessTokenizer()
-        model      = cls._build_model(config, tokenizer)
+        config = checkpoint["config"]
+        tokenizer = ChessTokenizer()
+        model = cls._build_model(config, tokenizer)
         model.load_state_dict(checkpoint["model_state"])
 
         return cls(model, tokenizer, device, temperature)
@@ -102,13 +102,13 @@ class ChessEngine:
     @staticmethod
     def _build_model(config: ChessTrainingConfig, tokenizer: ChessTokenizer) -> ChessTransformer:
         return ChessTransformer(
-            vocab_size  = tokenizer.vocab_size,
-            d_model     = config.d_model,
-            n_heads     = config.n_heads,
-            n_layers    = config.n_layers,
-            d_ff        = config.d_ff,
-            max_seq_len = config.max_seq_len,
-            dropout     = config.dropout,
+            vocab_size=tokenizer.vocab_size,
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            n_layers=config.n_layers,
+            d_ff=config.d_ff,
+            max_seq_len=config.max_seq_len,
+            dropout=config.dropout,
         )
 
     # ------------------------------------------------------------------ #
@@ -123,7 +123,7 @@ class ChessEngine:
         )  # [1, seq_len]
 
         with torch.no_grad():
-            mask   = make_causal_mask(inputs.size(1), self.device)
+            mask = make_causal_mask(inputs.size(1), self.device)
             logits = self.model(inputs, mask)
 
         next_logits = logits[0, -1, :]  # [vocab_size]
@@ -132,9 +132,9 @@ class ChessEngine:
         next_logits = next_logits / self.temperature
 
         # mask illegal moves
-        legal_mask    = self.tokenizer.get_legal_mask(self.board).to(self.device)
+        legal_mask = self.tokenizer.get_legal_mask(self.board).to(self.device)
         masked_logits = next_logits + legal_mask
-        probs         = F.softmax(masked_logits, dim=-1)
+        probs = F.softmax(masked_logits, dim=-1)
 
         if torch.isnan(probs).any() or torch.isinf(probs).any():
             legal_indices = (legal_mask == 0.0).nonzero(as_tuple=True)[0]
@@ -196,7 +196,7 @@ class ChessEngine:
         """Reset the board and set which color the player controls.
         If the player is black, the model immediately plays white's first move."""
         self.player_color = player_color
-        self.board        = chess.Board()
+        self.board = chess.Board()
         self.move_history = [self.tokenizer.BOS]
 
         if player_color == chess.BLACK:
@@ -208,7 +208,7 @@ class ChessEngine:
 
     def reset(self) -> chess.Board:
         """Reset the board, keeping the current player color."""
-        self.board        = chess.Board()
+        self.board = chess.Board()
         self.move_history = [self.tokenizer.BOS]
         return self.board
 
@@ -217,9 +217,9 @@ class ChessEngine:
         lastmove = self.board.peek() if self.board.move_stack else None
         return chess.svg.board(
             self.board,
-            lastmove = lastmove,
-            size     = 400,
-        ) # type: ignore
+            lastmove=lastmove,
+            size=400,
+        )  # type: ignore
 
     def __repr__(self) -> str:
         return (

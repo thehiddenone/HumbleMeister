@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import os
 import select
+from pathlib import Path
+from typing import Any
 
 import chess
 import chess.engine
 import torch
 import torch.nn.functional as F
-
-from pathlib import Path
-
 
 _MATE_CAP_CP = 2000
 
@@ -58,7 +57,7 @@ def _evaluate_batch_worker(
     engine = None
     try:
         engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-        data: list[dict] = torch.load(batch_path, weights_only=False)
+        data: list[dict[str, Any]] = torch.load(batch_path, weights_only=False)
         for item in data:
             moves_uci: list[str] = item.get("moves", [])
             n_moves = len(moves_uci)
@@ -109,9 +108,9 @@ class AsyncBatchEvaluator:
         n_workers: int,
     ) -> None:
         self._stockfish_path = stockfish_path
-        self._depth          = depth
-        self._temperature    = temperature
-        self._n_workers      = n_workers
+        self._depth = depth
+        self._temperature = temperature
+        self._n_workers = n_workers
         self._active: list[tuple[int, int, Path]] = []  # (pid, read_fd, batch_path)
 
     # ------------------------------------------------------------------ #

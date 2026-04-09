@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from types import TracebackType
+
 import chess
 import chess.engine
 import torch
 import torch.nn.functional as F
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from types import TracebackType
-
 
 _MATE_CAP_CP = 2000  # clamp mate scores to ±2000cp so they don't dominate advantage normalization
 
@@ -24,10 +24,7 @@ class StockfishEvaluator:
 
     def __init__(self, path: str = "stockfish", n_workers: int = 4) -> None:
         # one engine process per worker — never shared between threads simultaneously
-        self._engines = [
-            chess.engine.SimpleEngine.popen_uci(path)
-            for _ in range(n_workers)
-        ]
+        self._engines = [chess.engine.SimpleEngine.popen_uci(path) for _ in range(n_workers)]
         self._pool: queue.Queue[chess.engine.SimpleEngine] = queue.Queue()
         for engine in self._engines:
             self._pool.put(engine)
@@ -61,8 +58,7 @@ class StockfishEvaluator:
         """
         # submit all evaluations — each future captures its index for ordering
         futures = {
-            self._executor.submit(self.evaluate, board, depth): i
-            for i, board in enumerate(boards)
+            self._executor.submit(self.evaluate, board, depth): i for i, board in enumerate(boards)
         }
         results = [0.0] * len(boards)
         for future in as_completed(futures):
@@ -84,8 +80,8 @@ class StockfishEvaluator:
     def __exit__(
         self,
         _exc_type: type[BaseException] | None,
-        _exc_val:  BaseException | None,
-        _exc_tb:   TracebackType | None,
+        _exc_val: BaseException | None,
+        _exc_tb: TracebackType | None,
     ) -> None:
         self.close()
 
@@ -114,9 +110,9 @@ def _score(engine: chess.engine.SimpleEngine, board: chess.Board, depth: int) ->
 
 
 def compute_move_weights(
-    moves:       list[chess.Move],
-    evaluator:   StockfishEvaluator,
-    depth:       int   = 5,
+    moves: list[chess.Move],
+    evaluator: StockfishEvaluator,
+    depth: int = 5,
     temperature: float = 1.0,
 ) -> torch.Tensor:
     """
@@ -156,7 +152,7 @@ def compute_move_weights(
         return torch.ones(1)  # just EOS
 
     # replay the game to collect all N+1 board states (before + after each move)
-    board  = chess.Board()
+    board = chess.Board()
     boards = [board.copy()]
     for move in moves:
         board.push(move)
@@ -165,7 +161,7 @@ def compute_move_weights(
     # evaluate all positions in parallel — the single sequential bottleneck is gone
     evals = evaluator.evaluate_many(boards, depth)
 
-    N    = len(moves)
+    N = len(moves)
     advs = torch.tensor(
         [-evals[t] - evals[t - 1] for t in range(1, N + 1)],
         dtype=torch.float32,
