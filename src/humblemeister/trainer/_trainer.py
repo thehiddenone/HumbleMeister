@@ -84,9 +84,9 @@ class ChessTrainingConfig:
 
     # self-play curriculum — ramps in gradually after self_play_start_epoch
     self_play_start_epoch: int = 1000  # all bank games before this
-    self_play_ramp_epochs: int = 200  # epochs to ramp from 0% → max ratio
+    self_play_ramp_epochs: int = 400  # epochs to ramp from 0% → max ratio
     self_play_max_ratio: float = 0.3  # cap at 30% self-play games
-    self_play_batch_size: int = 64  # games per generation sub-batch (bounds KV-cache VRAM)
+    self_play_batch_size: int = 16  # games per generation sub-batch (bounds KV-cache VRAM)
 
     # stockfish evaluation
     use_stockfish: bool = True
@@ -94,6 +94,7 @@ class ChessTrainingConfig:
     stockfish_depth: int = 5  # depth 5 ≈ 1-5ms/position
     stockfish_workers: int = 4  # parallel engine processes for board evaluation
     advantage_temperature: float = 1.0  # sharpness of per-move weight distribution
+    value_loss_weight: float = 0.5  # relative weight of value loss vs policy loss
 
     # checkpointing
     checkpoint_dir: str = "env/checkpoints"
@@ -534,7 +535,7 @@ class ChessTrainer:
     # Training phase
     #
 
-    def train_on_games(self, epoch: int, self_play_ratio: float) -> tuple[float, bool]:
+    def train_on_games(self, epoch: int, self_play_ratio: float) -> tuple[float, float, bool]:
         self.__model.train()
 
         n_games = len(self.__dataset)
@@ -563,6 +564,7 @@ class ChessTrainer:
             outcome_weights = torch.tensor(0.0, device=self.__device)
 
         total_loss = 0.0
+        total_value_loss = 0.0
         nan_batches = 0
         self.__optimizer.zero_grad()
 
@@ -584,9 +586,11 @@ class ChessTrainer:
             ), f"target token ID {targets.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
 
             move_weights = cast(torch.Tensor, batch["move_weights"]).to(self.__device)
+            value_targets = cast(torch.Tensor, batch["value_evals"]).to(self.__device)
+            has_evals = cast(torch.Tensor, batch["has_value_evals"]).to(self.__device)
 
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
-                logits, _ = self.__model(input_ids, combined_mask)
+                logits, value_pred = self.__model(input_ids, combined_mask)
 
                 per_token_loss = F.cross_entropy(
                     logits.view(-1, self.__tokenizer.vocab_size),
@@ -599,7 +603,16 @@ class ChessTrainer:
                 pad_mask = (targets.view(-1) != self.__tokenizer.PAD).float()
                 weights_flat = move_weights.view(-1)
                 denom = pad_mask.sum().clamp(min=1)
-                loss = (per_token_loss * weights_flat * pad_mask).sum() / denom
+                policy_loss = (per_token_loss * weights_flat * pad_mask).sum() / denom
+
+                # value loss — only on positions from games that have Stockfish evals
+                token_mask = attention_mask.bool() & has_evals.unsqueeze(1)
+                if token_mask.any():
+                    value_loss = F.mse_loss(value_pred[token_mask], value_targets[token_mask])
+                    loss = policy_loss + self.__config.value_loss_weight * value_loss
+                else:
+                    value_loss = torch.tensor(0.0, device=self.__device)
+                    loss = policy_loss
 
             if torch.isnan(loss) or torch.isinf(loss):
                 print("warning: NaN/inf loss detected, skipping mini-batch")
@@ -613,11 +626,12 @@ class ChessTrainer:
             (scaled_loss / n_batches).backward()  # type: ignore[no-untyped-call]
 
             total_loss += scaled_loss.item()
+            total_value_loss += value_loss.item()
 
         if nan_batches == n_batches:
             print("warning: all mini-batches had NaN/inf loss, skipping update")
             self.__optimizer.zero_grad()
-            return total_loss, False
+            return total_loss, total_value_loss, False
 
         # check weights
         for name, p in self.__model.named_parameters():
@@ -628,13 +642,13 @@ class ChessTrainer:
         if any(torch.isnan(p.grad).any() for p in self.__model.parameters() if p.grad is not None):
             print("warning: NaN gradients detected, skipping update")
             self.__optimizer.zero_grad()
-            return total_loss, False
+            return total_loss, total_value_loss, False
 
         torch.nn.utils.clip_grad_norm_(self.__model.parameters(), max_norm=1.0)
         self.__optimizer.step()
         self.__optimizer.zero_grad()
 
-        return total_loss / n_batches, True
+        return total_loss / n_batches, total_value_loss / n_batches, True
 
     #
     # Value head pretraining
@@ -699,16 +713,15 @@ class ChessTrainer:
                 causal_mask = make_causal_mask(input_ids.size(1), self.__device)
                 padding_mask = make_padding_mask(attention_mask).to(self.__device)
 
-                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
-                    _, value_pred = self.__model(input_ids, causal_mask + padding_mask)
-
                 # mask: real tokens in games that actually have Stockfish evals
                 token_mask = attention_mask.bool() & has_evals.unsqueeze(1)
 
                 if not token_mask.any():
                     continue
 
-                loss = F.mse_loss(value_pred[token_mask], value_targets[token_mask])
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
+                    _, value_pred = self.__model(input_ids, causal_mask + padding_mask)
+                    loss = F.mse_loss(value_pred[token_mask], value_targets[token_mask])
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     continue
@@ -746,7 +759,7 @@ class ChessTrainer:
             attempt = 1
             while True:
                 self_play_ratio = self.generate_games(epoch)
-                loss, stepped = self.train_on_games(epoch, self_play_ratio)
+                loss, value_loss, stepped = self.train_on_games(epoch, self_play_ratio)
                 if stepped:
                     attempt = 1
                     break
@@ -764,7 +777,7 @@ class ChessTrainer:
             eval_ms = self.__eval_time_ms / max(self.__eval_game_count, 1)
 
             if epoch % self.__config.log_every == 0:
-                self.__log(epoch, loss, self_play_ratio, epoch_s, eval_ms)
+                self.__log(epoch, loss, value_loss, self_play_ratio, epoch_s, eval_ms)
 
             if epoch > 0 and epoch % self.__config.checkpoint_every == 0:
                 self.__save_checkpoint(epoch, loss)
@@ -784,7 +797,13 @@ class ChessTrainer:
     #
 
     def __log(
-        self, epoch: int, loss: float, self_play_ratio: float, epoch_s: float, eval_ms: float
+        self,
+        epoch: int,
+        loss: float,
+        value_loss: float,
+        self_play_ratio: float,
+        epoch_s: float,
+        eval_ms: float,
     ) -> None:
         games = self.__dataset.games
         n_games = len(games)
@@ -799,6 +818,7 @@ class ChessTrainer:
 
         # tensorboard
         self.writer.add_scalar("loss/train", loss, epoch)
+        self.writer.add_scalar("loss/value", value_loss, epoch)
         self.writer.add_scalar("games/avg_length", avg_len, epoch)
         self.writer.add_scalar("games/win_rate", win_rate, epoch)
         self.writer.add_scalar("games/draw_rate", draw_rate, epoch)
@@ -843,8 +863,15 @@ class ChessTrainer:
         path = checkpoints[-1]
         checkpoint = torch.load(path, map_location=self.__device)
 
-        self.__model.load_state_dict(checkpoint["model_state"])
-        self.__optimizer.load_state_dict(checkpoint["optimizer_state"])
+        result = self.__model.load_state_dict(checkpoint["model_state"], strict=False)
+        if result.missing_keys:
+            print(f"  initialized missing keys from scratch: {result.missing_keys}")
+        if result.unexpected_keys:
+            print(f"  ignored unexpected keys: {result.unexpected_keys}")
+        try:
+            self.__optimizer.load_state_dict(checkpoint["optimizer_state"])
+        except ValueError:
+            print("  optimizer state incompatible (model changed), starting optimizer fresh")
         self.__scheduler.load_state_dict(checkpoint["scheduler_state"])
         self.__start_epoch = checkpoint["epoch"] + 1
 
