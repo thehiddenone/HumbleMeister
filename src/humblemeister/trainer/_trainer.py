@@ -165,7 +165,7 @@ class ChessTrainingConfig:
         result.n_heads = 24
         result.n_layers = 24
         result.d_ff = 6144
-        result.train_batch_size = 12
+        result.train_batch_size = 4
         result.n_games = 4096
         return result
 
@@ -751,12 +751,15 @@ class ChessTrainer:
     # Main loop
     #
 
-    def run(self) -> None:
+    def run(self, max_epochs: int | None = None) -> None:
         print(f"training on {self.__config.device}")
         print(f"model parameters: {sum(p.numel() for p in self.__model.parameters()):,}")
 
+        end_epoch = min(self.__start_epoch + max_epochs, self.__config.n_epochs) if max_epochs else self.__config.n_epochs
+
         loss = 0.0
-        for epoch in tqdm(range(self.__start_epoch, self.__config.n_epochs)):
+        value_loss = 0.0
+        for epoch in tqdm(range(self.__start_epoch, end_epoch)):
             epoch_start = time.perf_counter()
 
             cycle = 10
@@ -790,7 +793,8 @@ class ChessTrainer:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-        self.__save_checkpoint(self.__config.n_epochs - 1, loss)
+        self.__start_epoch = end_epoch
+        self.__save_checkpoint(end_epoch - 1, loss)
         self.writer.close()
         if self.__evaluator is not None:
             self.__evaluator.close()
