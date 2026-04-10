@@ -209,6 +209,7 @@ class ChessTrainer:
     __dataset: ChessDataset
     __gamebank: ChessGameBank
     __start_epoch: int
+    __last_loss: float
 
     def __init__(
         self, config: ChessTrainingConfig, game_bank: ChessGameBank, resume: bool = False
@@ -216,6 +217,7 @@ class ChessTrainer:
         self.__config = config
         self.__device = torch.device(config.device)
         self.__start_epoch = 0
+        self.__last_loss = 0.0
         self.__tokenizer = ChessTokenizer()
         self.__dataset = ChessDataset(self.__tokenizer)
         self.__gamebank = game_bank
@@ -648,7 +650,8 @@ class ChessTrainer:
         self.__optimizer.step()
         self.__optimizer.zero_grad()
 
-        return total_loss / n_batches, total_value_loss / n_batches, True
+        self.__last_loss = total_loss / n_batches
+        return self.__last_loss, total_value_loss / n_batches, True
 
     #
     # Value head pretraining
@@ -741,6 +744,7 @@ class ChessTrainer:
         for p in self.__model.parameters():
             p.requires_grad = True
 
+        self.__save_checkpoint(self.__start_epoch - 1, self.__last_loss)
         print("value head pretraining complete")
 
     #
@@ -874,6 +878,7 @@ class ChessTrainer:
             print("  optimizer state incompatible (model changed), starting optimizer fresh")
         self.__scheduler.load_state_dict(checkpoint["scheduler_state"])
         self.__start_epoch = checkpoint["epoch"] + 1
+        self.__last_loss = float(checkpoint["loss"])
 
         print(
             f"resumed from {path.name} (epoch {checkpoint['epoch']}, loss {checkpoint['loss']:.4f})"
