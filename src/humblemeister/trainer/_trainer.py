@@ -89,22 +89,24 @@ class ChessTrainingConfig:
     self_play_start_epoch: int = 1000  # all bank games before this
     self_play_ramp_epochs: int = 400  # epochs to ramp from 0% → max ratio
     self_play_max_ratio: float = 0.3  # cap at 30% self-play games
-    self_play_batch_size: int = 16  # games per generation sub-batch (bounds KV-cache VRAM)
+    self_play_batch_size: int = 64  # games per generation sub-batch
 
     # stockfish evaluation
     use_stockfish: bool = True
     stockfish_path: str = "stockfish"
     stockfish_depth: int = 5  # depth 5 ≈ 1-5ms/position
-    stockfish_workers: int = 4  # parallel engine processes for board evaluation
+    stockfish_workers: int = 24  # parallel engine processes for board evaluation
     advantage_temperature: float = 1.0  # sharpness of per-move weight distribution
     value_loss_weight: float = 0.5  # relative weight of value loss vs policy loss
-    self_play_kv_cache: bool = False  # use KV cache during self-play generation (faster but more VRAM)
-    self_play_value_weight: float = 0.0  # λ for value-blended move selection during self-play
+    self_play_kv_cache: bool = (
+        False  # use KV cache during self-play generation (faster but more VRAM)
+    )
+    self_play_value_weight: float = 0.0  # weight for value-blended move selection during self-play
 
     # checkpointing
     checkpoint_dir: str = "env/checkpoints"
     checkpoint_every: int = 50  # save every N epochs
-    keep_last_n: int = 5  # keep only the last N checkpoints
+    keep_last_n: int = 10  # keep only the last N checkpoints
 
     # logging
     log_dir: str = "env/logs"
@@ -220,6 +222,10 @@ class ChessTrainer:
     __selfplay_max_override: float | None
     __run_start_epoch: int
     __run_end_epoch: int
+    __sp_gen_time_s: float
+    __sp_eval_time_s: float
+    __sp_games_generated: int
+    __sp_games_included: int
 
     def __init__(
         self, config: ChessTrainingConfig, game_bank: ChessGameBank, resume: bool = False
@@ -337,6 +343,10 @@ class ChessTrainer:
         self.__dataset.clear()
         self.__eval_time_ms = 0.0  # cumulative Stockfish wall time this epoch
         self.__eval_game_count = 0  # number of games evaluated
+        self.__sp_gen_time_s = 0.0
+        self.__sp_eval_time_s = 0.0
+        self.__sp_games_generated = 0
+        self.__sp_games_included = 0
 
         ratio = self._self_play_ratio(epoch)
         n_self_play = int(self.__config.n_games * ratio)
@@ -541,6 +551,7 @@ class ChessTrainer:
                     move_weights=item.get("weights"),
                 )
             )
+            self.__sp_games_included += 1
 
     def __generate_self_play(self, n_self_play: int) -> None:
         """
@@ -565,16 +576,23 @@ class ChessTrainer:
         generated = 0
         try:
             while generated < n_self_play:
-                batch = self.__generation_round(batch_size)
+                this_batch = min(batch_size, n_self_play - generated)
+                t_gen = time.perf_counter()
+                batch = self.__generation_round(this_batch)
+                self.__sp_gen_time_s += time.perf_counter() - t_gen
+
                 if not batch:
                     continue
                 generated += len(batch)
+                self.__sp_games_generated += len(batch)
 
                 if evaluator is not None:
                     # save to temp file and submit for async evaluation;
                     # submit() may block here if the worker pool is full,
                     # returning any batch that just finished as it yields a slot
+                    t_eval = time.perf_counter()
                     completed = evaluator.submit(_save_temp_batch(batch))
+                    self.__sp_eval_time_s += time.perf_counter() - t_eval
                     for path in completed:
                         self.__add_batch_to_dataset(path)
                 else:
@@ -591,13 +609,16 @@ class ChessTrainer:
                                     move_weights=None,
                                 )
                             )
+                            self.__sp_games_included += 1
                         except Exception:
                             continue
 
             # drain any batches still being evaluated
             if evaluator is not None:
+                t_eval = time.perf_counter()
                 for path in evaluator.drain():
                     self.__add_batch_to_dataset(path)
+                self.__sp_eval_time_s += time.perf_counter() - t_eval
 
         finally:
             if evaluator is not None:
@@ -833,13 +854,26 @@ class ChessTrainer:
         print(f"training on {self.__config.device}")
         print(f"model parameters: {sum(p.numel() for p in self.__model.parameters()):,}")
 
-        end_epoch = min(self.__start_epoch + max_epochs, self.__config.n_epochs) if max_epochs else self.__config.n_epochs
+        end_epoch = self.__start_epoch + max_epochs if max_epochs else self.__config.n_epochs
+        if end_epoch > self.__config.n_epochs:
+            self.__config.n_epochs = end_epoch
+            self.__scheduler = get_scheduler(
+                self.__optimizer, end_epoch, self.__config.warmup_epochs
+            )
 
         self.__disable_selfplay = disable_selfplay
         self.__selfplay_min_override = self_play_min
         self.__selfplay_max_override = self_play_max
-        self.__selfplay_stockfish_depth = self_play_stockfish_depth if self_play_stockfish_depth is not None else self.__config.stockfish_depth
-        self.__selfplay_value_weight = self_play_value_weight if self_play_value_weight is not None else self.__config.self_play_value_weight
+        self.__selfplay_stockfish_depth = (
+            self_play_stockfish_depth
+            if self_play_stockfish_depth is not None
+            else self.__config.stockfish_depth
+        )
+        self.__selfplay_value_weight = (
+            self_play_value_weight
+            if self_play_value_weight is not None
+            else self.__config.self_play_value_weight
+        )
         self.__run_start_epoch = self.__start_epoch
         self.__run_end_epoch = end_epoch
 
@@ -925,6 +959,10 @@ class ChessTrainer:
         self.writer.add_scalar("lr", current_lr, epoch)
         self.writer.add_scalar("perf/epoch_s", epoch_s, epoch)
         self.writer.add_scalar("perf/eval_ms_per_game", eval_ms, epoch)
+        self.writer.add_scalar("self_play/gen_time_s", self.__sp_gen_time_s, epoch)
+        self.writer.add_scalar("self_play/eval_time_s", self.__sp_eval_time_s, epoch)
+        self.writer.add_scalar("self_play/games_generated", self.__sp_games_generated, epoch)
+        self.writer.add_scalar("self_play/games_included", self.__sp_games_included, epoch)
 
     #
     # Checkpointing

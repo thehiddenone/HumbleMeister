@@ -1,10 +1,9 @@
 from __future__ import annotations
 
+import chess
 import torch
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
-
-import chess
 
 from humblemeister.attention import make_causal_mask, make_padding_mask
 from humblemeister.data import ChessTokenizer
@@ -50,9 +49,7 @@ def sample_move(
     # ------------------------------------------------------------------ #
     #  Step 1: policy logits at the current position                      #
     # ------------------------------------------------------------------ #
-    input_ids = torch.tensor(
-        [move_history], dtype=torch.long, device=device
-    )  # [1, seq_len]
+    input_ids = torch.tensor([move_history], dtype=torch.long, device=device)  # [1, seq_len]
 
     with torch.no_grad():
         causal_mask = make_causal_mask(input_ids.size(1), device)
@@ -86,7 +83,7 @@ def sample_move(
         padded = pad_sequence(sequences, batch_first=True, padding_value=tokenizer.PAD)
         # [n_legal, seq_len+1]
 
-        attention_mask = (padded != tokenizer.PAD)
+        attention_mask = padded != tokenizer.PAD
         padding_mask = make_padding_mask(attention_mask).to(device)
         causal_mask_v = make_causal_mask(padded.size(1), device)
 
