@@ -7,10 +7,9 @@ from typing import overload
 import chess
 import chess.svg
 import torch
-import torch.nn.functional as F
 
-from .attention import make_causal_mask
 from .data import ChessTokenizer
+from .inference import sample_move
 from .trainer import ChessTrainingConfig
 from .transformer import ChessTransformer
 
@@ -22,11 +21,13 @@ class ChessEngine:
         tokenizer: ChessTokenizer,
         device: str = "cpu",
         temperature: float = 1.0,
+        value_weight: float = 0.0,
     ) -> None:
         self.model = model.to(device)
         self.tokenizer = tokenizer
         self.device = torch.device(device)
         self.temperature = temperature
+        self.value_weight = value_weight
         self.player_color: chess.Color | None = None
         self.board = chess.Board()
         self.move_history: list[int] = [self.tokenizer.BOS]
@@ -43,6 +44,7 @@ class ChessEngine:
         path: str,
         device: str = "cpu",
         temperature: float = 1.0,
+        value_weight: float = 0.0,
     ) -> ChessEngine:
         from safetensors.torch import load_file
 
@@ -66,7 +68,7 @@ class ChessEngine:
                 f"missing: {unexpected_missing}, unexpected: {incompatible.unexpected_keys}"
             )
 
-        return cls(model, tokenizer, device, temperature)
+        return cls(model, tokenizer, device, temperature, value_weight)
 
     @classmethod
     def from_pt(
@@ -74,6 +76,7 @@ class ChessEngine:
         path: str,
         device: str = "cpu",
         temperature: float = 1.0,
+        value_weight: float = 0.0,
     ) -> ChessEngine:
         checkpoint = torch.load(path, map_location=device)
         config = checkpoint["config"]
@@ -81,7 +84,7 @@ class ChessEngine:
         model = cls._build_model(config, tokenizer)
         model.load_state_dict(checkpoint["model_state"])
 
-        return cls(model, tokenizer, device, temperature)
+        return cls(model, tokenizer, device, temperature, value_weight)
 
     @classmethod
     def load(
@@ -89,13 +92,14 @@ class ChessEngine:
         path: str,
         device: str = "cpu",
         temperature: float = 1.0,
+        value_weight: float = 0.0,
     ) -> ChessEngine:
         """Load from either a safetensors directory or a .pt file."""
         p = Path(path)
         if p.is_dir() and (p / "model.safetensors").exists():
-            return cls.from_safetensors(path, device, temperature)
+            return cls.from_safetensors(path, device, temperature, value_weight)
         elif p.suffix == ".pt":
-            return cls.from_pt(path, device, temperature)
+            return cls.from_pt(path, device, temperature, value_weight)
         else:
             raise ValueError(f"could not find a valid model at {path}")
 
@@ -116,33 +120,15 @@ class ChessEngine:
     # ------------------------------------------------------------------ #
 
     def _sample_move(self) -> chess.Move:
-        inputs = torch.tensor(
-            [self.move_history],
-            dtype=torch.long,
+        return sample_move(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            board=self.board,
+            move_history=self.move_history,
             device=self.device,
-        )  # [1, seq_len]
-
-        with torch.no_grad():
-            mask = make_causal_mask(inputs.size(1), self.device)
-            logits = self.model(inputs, mask)
-
-        next_logits = logits[0, -1, :]  # [vocab_size]
-
-        # apply temperature — higher = more random, lower = more deterministic
-        next_logits = next_logits / self.temperature
-
-        # mask illegal moves
-        legal_mask = self.tokenizer.get_legal_mask(self.board).to(self.device)
-        masked_logits = next_logits + legal_mask
-        probs = F.softmax(masked_logits, dim=-1)
-
-        if torch.isnan(probs).any() or torch.isinf(probs).any():
-            legal_indices = (legal_mask == 0.0).nonzero(as_tuple=True)[0]
-            token_id = legal_indices[torch.randint(len(legal_indices), (1,))].item()
-        else:
-            token_id = torch.multinomial(probs, num_samples=1).item()
-
-        return self.tokenizer.decode_move(int(token_id))  # type: ignore
+            temperature=self.temperature,
+            value_weight=self.value_weight,
+        )
 
     def _apply_move(self, move: chess.Move) -> None:
         if move not in self.board.legal_moves:

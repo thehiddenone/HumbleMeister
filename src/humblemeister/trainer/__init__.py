@@ -1,3 +1,4 @@
+from ._loss_tracker import LossBreakthroughDetector
 from ._trainer import (
     ChessTrainer,
     ChessTrainingConfig,
@@ -6,4 +7,5 @@ from ._trainer import (
 __all__ = [
     "ChessTrainer",
     "ChessTrainingConfig",
+    "LossBreakthroughDetector",
 ]

@@ -23,7 +23,10 @@ from tqdm import tqdm
 from humblemeister.attention import KVCache, make_causal_mask, make_padding_mask
 from humblemeister.data import ChessDataset, ChessGameBank, ChessTokenizer, GameRecord
 from humblemeister.evaluation import AsyncBatchEvaluator, StockfishEvaluator, compute_move_weights
+from humblemeister.inference import sample_move
 from humblemeister.transformer import ChessTransformer
+
+from ._loss_tracker import LossBreakthroughDetector
 
 
 def _save_temp_batch(batch: list[dict[str, Any]]) -> Path:
@@ -96,6 +99,7 @@ class ChessTrainingConfig:
     advantage_temperature: float = 1.0  # sharpness of per-move weight distribution
     value_loss_weight: float = 0.5  # relative weight of value loss vs policy loss
     self_play_kv_cache: bool = False  # use KV cache during self-play generation (faster but more VRAM)
+    self_play_value_weight: float = 0.0  # λ for value-blended move selection during self-play
 
     # checkpointing
     checkpoint_dir: str = "env/checkpoints"
@@ -228,6 +232,7 @@ class ChessTrainer:
         self.__selfplay_min_override: float | None = None
         self.__selfplay_max_override: float | None = None
         self.__selfplay_stockfish_depth: int = config.stockfish_depth
+        self.__selfplay_value_weight: float = config.self_play_value_weight
         self.__run_start_epoch = 0
         self.__run_end_epoch = config.n_epochs
         self.__tokenizer = ChessTokenizer()
@@ -470,59 +475,30 @@ class ChessTrainer:
         max_moves = self.__config.max_moves
         results: list[dict[str, Any]] = []
 
-        with torch.no_grad():
-            while active:
-                # build full sequence for each active game — recompute attention from scratch
-                max_len = max(len(move_history[i]) for i in active)
-                input_ids = torch.full(
-                    (len(active), max_len),
-                    fill_value=self.__tokenizer.PAD,
-                    dtype=torch.long,
+        while active:
+            still_active = []
+            for game_idx in active:
+                board = boards[game_idx]
+                move = sample_move(
+                    model=self.__model,
+                    tokenizer=self.__tokenizer,
+                    board=board,
+                    move_history=move_history[game_idx],
                     device=self.__device,
+                    value_weight=self.__selfplay_value_weight,
+                    bf16=self.__config.bf16,
                 )
-                for idx, game_idx in enumerate(active):
-                    seq = move_history[game_idx]
-                    input_ids[idx, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=self.__device)
+                board.push(move)
+                move_history[game_idx].append(self.__tokenizer.encode_move(move))
 
-                attention_mask = (input_ids != self.__tokenizer.PAD)
-                padding_mask = make_padding_mask(attention_mask).to(self.__device)
-                causal_mask = make_causal_mask(max_len, self.__device)
+                if board.is_game_over() or len(move_history[game_idx]) >= max_moves:
+                    game = self.__extract_game(boards[game_idx], move_history[game_idx])
+                    if game is not None:
+                        results.append(game)
+                else:
+                    still_active.append(game_idx)
 
-                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
-                    logits, _ = self.__model(input_ids, causal_mask + padding_mask)
-
-                # extract logits at the last real token position for each game
-                seq_lens = attention_mask.sum(dim=1) - 1  # index of last token
-                next_logits_list = [logits[idx, seq_lens[idx]] for idx in range(len(active))]
-
-                still_active = []
-                for idx, game_idx in enumerate(active):
-                    board = boards[game_idx]
-                    legal_mask = self.__tokenizer.get_legal_mask(board).to(self.__device)
-                    masked_logits = next_logits_list[idx] + legal_mask
-                    probs = F.softmax(masked_logits, dim=-1)
-
-                    if torch.isnan(probs).any() or torch.isinf(probs).any():
-                        legal_indices = (legal_mask == 0.0).nonzero(as_tuple=True)[0]
-                        token_id = legal_indices[torch.randint(len(legal_indices), (1,))].item()
-                    else:
-                        token_id = torch.multinomial(probs, num_samples=1).item()
-
-                    move = self.__tokenizer.decode_move(int(token_id))
-                    if move is None:
-                        raise RuntimeError(f"unexpected move: {move}")
-
-                    board.push(move)
-                    move_history[game_idx].append(int(token_id))
-
-                    if board.is_game_over() or len(move_history[game_idx]) >= max_moves:
-                        game = self.__extract_game(boards[game_idx], move_history[game_idx])
-                        if game is not None:
-                            results.append(game)
-                    else:
-                        still_active.append(game_idx)
-
-                active = still_active
+            active = still_active
 
         return results
 
@@ -851,7 +827,8 @@ class ChessTrainer:
         disable_selfplay: bool = False,
         self_play_min: float | None = None,
         self_play_max: float | None = None,
-        self_play_stockfish_depth: int = 5,
+        self_play_stockfish_depth: int | None = 5,
+        self_play_value_weight: float | None = None,
     ) -> None:
         print(f"training on {self.__config.device}")
         print(f"model parameters: {sum(p.numel() for p in self.__model.parameters()):,}")
@@ -861,12 +838,14 @@ class ChessTrainer:
         self.__disable_selfplay = disable_selfplay
         self.__selfplay_min_override = self_play_min
         self.__selfplay_max_override = self_play_max
-        self.__selfplay_stockfish_depth = self_play_stockfish_depth
+        self.__selfplay_stockfish_depth = self_play_stockfish_depth if self_play_stockfish_depth is not None else self.__config.stockfish_depth
+        self.__selfplay_value_weight = self_play_value_weight if self_play_value_weight is not None else self.__config.self_play_value_weight
         self.__run_start_epoch = self.__start_epoch
         self.__run_end_epoch = end_epoch
 
         loss = 0.0
         value_loss = 0.0
+        breakthrough_detector = LossBreakthroughDetector()
         for epoch in tqdm(range(self.__start_epoch, end_epoch)):
             epoch_start = time.perf_counter()
 
@@ -894,7 +873,11 @@ class ChessTrainer:
             if epoch % self.__config.log_every == 0:
                 self.__log(epoch, loss, value_loss, self_play_ratio, epoch_s, eval_ms)
 
-            if epoch > 0 and epoch % self.__config.checkpoint_every == 0:
+            is_scheduled = epoch > 0 and epoch % self.__config.checkpoint_every == 0
+            is_breakthrough = breakthrough_detector.update(loss)
+            if is_scheduled or is_breakthrough:
+                if is_breakthrough:
+                    print(f"  loss breakthrough at epoch {epoch} ({loss:.4f}) — saving checkpoint")
                 self.__save_checkpoint(epoch, loss)
 
             # keep memory under control
