@@ -41,63 +41,82 @@ def _compute_weights(evals: list[float], n_moves: int, temperature: float) -> to
     return torch.cat([weights, torch.ones(1)], dim=0)
 
 
-def _evaluate_batch_worker(
-    batch_path: str,
+def _persistent_worker(
     stockfish_path: str,
     depth: int,
     temperature: float,
-    write_fd: int,
+    job_r_fd: int,
+    done_w_fd: int,
 ) -> None:
     """
-    Runs inside a forked child process.
-    Loads the batch from batch_path, evaluates every game with Stockfish,
-    writes per-move weights back in-place, then closes write_fd to signal
-    completion to the parent.  Always calls os._exit() — never returns.
+    Runs in a forked child process for the lifetime of AsyncBatchEvaluator.
+    Reads batch file paths from job_r_fd (one newline-terminated path per job),
+    evaluates each batch in-place, then writes "OK\\n" to done_w_fd.
+    Exits cleanly when job_r_fd is closed by the parent.
     """
-    engine = None
     try:
         engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-        data: list[dict[str, Any]] = torch.load(batch_path, weights_only=False)
-        for item in data:
-            moves_uci: list[str] = item.get("moves", [])
-            n_moves = len(moves_uci)
-            try:
-                moves = [chess.Move.from_uci(u) for u in moves_uci]
-                board = chess.Board()
-                boards = [board.copy()]
-                for move in moves:
-                    board.push(move)
-                    boards.append(board.copy())
-                evals = [_score_board(engine, b, depth) for b in boards]
-                item["weights"] = _compute_weights(evals, n_moves, temperature)
-            except Exception:
-                item["weights"] = torch.ones(n_moves + 1)
-        torch.save(data, batch_path)
     except Exception:
-        pass  # parent will load whatever is in the file (partial or no weights)
+        os.close(job_r_fd)
+        os.close(done_w_fd)
+        os._exit(1)
+
+    buf = b""
+    try:
+        while True:
+            chunk = os.read(job_r_fd, 4096)
+            if not chunk:
+                break  # parent closed job pipe → shutdown
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                batch_path = line.decode().strip()
+                if not batch_path:
+                    continue
+                # evaluate batch file in-place
+                try:
+                    data: list[dict[str, Any]] = torch.load(batch_path, weights_only=False)
+                    for item in data:
+                        moves_uci: list[str] = item.get("moves", [])
+                        n_moves = len(moves_uci)
+                        try:
+                            moves = [chess.Move.from_uci(u) for u in moves_uci]
+                            board = chess.Board()
+                            boards = [board.copy()]
+                            for move in moves:
+                                board.push(move)
+                                boards.append(board.copy())
+                            evals = [_score_board(engine, b, depth) for b in boards]
+                            item["weights"] = _compute_weights(evals, n_moves, temperature)
+                        except Exception:
+                            item["weights"] = torch.ones(n_moves + 1)
+                    torch.save(data, batch_path)
+                except Exception:
+                    pass
+                os.write(done_w_fd, b"OK\n")
     finally:
-        if engine is not None:
-            try:
-                engine.quit()
-            except Exception:
-                pass
-        os.close(write_fd)
+        try:
+            engine.quit()
+        except Exception:
+            pass
+        os.close(job_r_fd)
+        os.close(done_w_fd)
 
     os._exit(0)
 
 
 class AsyncBatchEvaluator:
     """
-    Pool of forked Stockfish workers that evaluate game batches in parallel.
+    Pool of persistent Stockfish worker processes that evaluate game batches in parallel.
 
-    Each submitted batch is a temp file in the format list[dict] with keys
-    "moves" (list[str] UCI), "outcome" (float), and optionally "weights".
-    The child process evaluates all games, writes weights back in-place, and
-    signals completion by closing its pipe write-end.  The parent detects
-    completion via select() on the read-end.
+    Workers are forked once on construction and kept alive for the lifetime of the
+    evaluator — Stockfish startup cost is paid only once per worker, not per batch.
+    Job dispatch and completion signaling use pipes carrying short strings;
+    batch data stays in temp files on disk.
 
-    The pool is bounded to n_workers concurrent forks.  submit() blocks if
-    all slots are taken, waiting for one to finish before forking a new one.
+    submit() sends a batch file path to an idle worker (blocking if all are busy).
+    drain() waits for all in-flight workers to finish.
+    close() shuts down all workers cleanly.
     """
 
     def __init__(
@@ -105,13 +124,31 @@ class AsyncBatchEvaluator:
         stockfish_path: str,
         depth: int,
         temperature: float,
-        n_workers: int,
+        n_workers: int = 24,
     ) -> None:
-        self._stockfish_path = stockfish_path
-        self._depth = depth
-        self._temperature = temperature
-        self._n_workers = n_workers
-        self._active: list[tuple[int, int, Path]] = []  # (pid, read_fd, batch_path)
+        # (pid, job_w_fd, done_r_fd) for each worker
+        self._workers: list[tuple[int, int, int]] = []
+        self._idle: list[int] = []  # indices into self._workers
+        self._busy: dict[int, tuple[int, Path]] = {}  # done_r_fd → (worker_idx, batch_path)
+        self._done_bufs: dict[int, bytes] = {}  # partial-read buffers keyed by done_r_fd
+
+        for i in range(n_workers):
+            job_r, job_w = os.pipe()
+            done_r, done_w = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                # child — close parent-side fds and run worker loop
+                os.close(job_w)
+                os.close(done_r)
+                _persistent_worker(stockfish_path, depth, temperature, job_r, done_w)
+                os._exit(0)
+            else:
+                # parent — close child-side fds, track worker
+                os.close(job_r)
+                os.close(done_w)
+                self._workers.append((pid, job_w, done_r))
+                self._idle.append(i)
+                self._done_bufs[done_r] = b""
 
     # ------------------------------------------------------------------ #
     #  Public API                                                          #
@@ -120,42 +157,44 @@ class AsyncBatchEvaluator:
     def submit(self, batch_path: Path) -> list[Path]:
         """
         Submit a batch file for async Stockfish evaluation.
-        If all n_workers slots are busy, blocks until one finishes.
+        If all workers are busy, blocks until one finishes.
         Returns paths of any batches that completed while waiting.
         """
         completed: list[Path] = []
-        if len(self._active) >= self._n_workers:
+        if not self._idle:
             completed.append(self._wait_one())
 
-        r_fd, w_fd = os.pipe()
-        pid = os.fork()
-        if pid == 0:
-            # child — evaluate and exit
-            os.close(r_fd)
-            _evaluate_batch_worker(
-                str(batch_path),
-                self._stockfish_path,
-                self._depth,
-                self._temperature,
-                w_fd,
-            )
-            os._exit(0)  # _evaluate_batch_worker calls os._exit, but be safe
-        else:
-            # parent — track the new worker
-            os.close(w_fd)
-            self._active.append((pid, r_fd, batch_path))
+        worker_idx = self._idle.pop()
+        _, job_w, done_r = self._workers[worker_idx]
+        os.write(job_w, (str(batch_path) + "\n").encode())
+        self._busy[done_r] = (worker_idx, batch_path)
 
         return completed
 
     def drain(self) -> list[Path]:
         """Block until all in-flight workers finish. Returns their batch paths."""
         completed: list[Path] = []
-        while self._active:
+        while self._busy:
             completed.append(self._wait_one())
         return completed
 
     def close(self) -> None:
+        """Drain pending work then shut down all worker processes."""
         self.drain()
+        for pid, job_w, done_r in self._workers:
+            try:
+                os.close(job_w)  # EOF on worker's job_r → worker exits
+            except OSError:
+                pass
+        for pid, job_w, done_r in self._workers:
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+            try:
+                os.close(done_r)
+            except OSError:
+                pass
 
     def __enter__(self) -> AsyncBatchEvaluator:
         return self
@@ -168,21 +207,18 @@ class AsyncBatchEvaluator:
     # ------------------------------------------------------------------ #
 
     def _wait_one(self) -> Path:
-        """Block until any one worker closes its pipe. Returns its batch path."""
-        read_fds = [fd for _, fd, _ in self._active]
-        readable, _, _ = select.select(read_fds, [], [])
-        return self._reap(readable[0])
+        """Block until any one busy worker signals completion. Returns its batch path."""
+        done_fds = list(self._busy.keys())
+        readable, _, _ = select.select(done_fds, [], [])
+        fd = readable[0]
 
-    def _reap(self, fd: int) -> Path:
-        """Drain pipe to EOF, reap the child process, remove from active list."""
-        while os.read(fd, 4096):
-            pass
-        os.close(fd)
+        # read "OK\n" from the done pipe — buffer handles partial reads
+        buf = self._done_bufs[fd]
+        while b"\n" not in buf:
+            buf += os.read(fd, 64)
+        # consume exactly one response; keep any remainder for the next job
+        self._done_bufs[fd] = buf[buf.index(b"\n") + 1 :]
 
-        for i, (pid, rfd, path) in enumerate(self._active):
-            if rfd == fd:
-                os.waitpid(pid, 0)
-                self._active.pop(i)
-                return path
-
-        raise RuntimeError(f"no active entry for fd {fd}")
+        worker_idx, batch_path = self._busy.pop(fd)
+        self._idle.append(worker_idx)
+        return batch_path

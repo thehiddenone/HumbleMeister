@@ -95,6 +95,7 @@ class ChessTrainingConfig:
     stockfish_workers: int = 4  # parallel engine processes for board evaluation
     advantage_temperature: float = 1.0  # sharpness of per-move weight distribution
     value_loss_weight: float = 0.5  # relative weight of value loss vs policy loss
+    self_play_kv_cache: bool = False  # use KV cache during self-play generation (faster but more VRAM)
 
     # checkpointing
     checkpoint_dir: str = "env/checkpoints"
@@ -210,6 +211,11 @@ class ChessTrainer:
     __gamebank: ChessGameBank
     __start_epoch: int
     __last_loss: float
+    __disable_selfplay: bool
+    __selfplay_min_override: float | None
+    __selfplay_max_override: float | None
+    __run_start_epoch: int
+    __run_end_epoch: int
 
     def __init__(
         self, config: ChessTrainingConfig, game_bank: ChessGameBank, resume: bool = False
@@ -218,6 +224,12 @@ class ChessTrainer:
         self.__device = torch.device(config.device)
         self.__start_epoch = 0
         self.__last_loss = 0.0
+        self.__disable_selfplay = False
+        self.__selfplay_min_override: float | None = None
+        self.__selfplay_max_override: float | None = None
+        self.__selfplay_stockfish_depth: int = config.stockfish_depth
+        self.__run_start_epoch = 0
+        self.__run_end_epoch = config.n_epochs
         self.__tokenizer = ChessTokenizer()
         self.__dataset = ChessDataset(self.__tokenizer)
         self.__gamebank = game_bank
@@ -249,7 +261,11 @@ class ChessTrainer:
 
         self.writer = SummaryWriter(config.log_dir)
 
-    def save_model(self, path: Path, safe: bool = True) -> None:
+    def save_model(self, path: Path | None = None, safe: bool = True) -> None:
+        if path is None:
+            path = Path(".") / "env" / "out" / self.__config.model_name
+        if path.exists():
+            shutil.rmtree(path)
         if safe:
             path.mkdir(parents=True, exist_ok=True)
 
@@ -283,9 +299,22 @@ class ChessTrainer:
     def _self_play_ratio(self, epoch: int) -> float:
         """
         Returns the fraction of games that should come from self-play this epoch.
-        0.0 before self_play_start_epoch, then linearly ramps to self_play_max_ratio
-        over self_play_ramp_epochs, and stays there.
+        If disable_selfplay is set, always returns 0.0.
+        If selfplay_min/max overrides are set, linearly interpolates between them
+        over the current run's epoch range (run_start_epoch → run_end_epoch).
+        Otherwise falls back to the config schedule.
         """
+        if self.__disable_selfplay:
+            return 0.0
+
+        if self.__selfplay_min_override is not None and self.__selfplay_max_override is not None:
+            run_len = max(self.__run_end_epoch - self.__run_start_epoch, 1)
+            progress = (epoch - self.__run_start_epoch) / run_len
+            progress = max(0.0, min(1.0, progress))
+            return self.__selfplay_min_override + progress * (
+                self.__selfplay_max_override - self.__selfplay_min_override
+            )
+
         cfg = self.__config
         progress = (epoch - cfg.self_play_start_epoch) / max(cfg.self_play_ramp_epochs, 1)
         return (
@@ -369,27 +398,29 @@ class ChessTrainer:
             )
 
     def __generation_round(self, n: int) -> list[dict[str, Any]]:
-        """Generate n self-play games. Returns raw game dicts with no weights."""
+        """Dispatch to KV-cache or full-recompute generation based on config."""
+        if self.__config.self_play_kv_cache:
+            return self.__generation_round_kv_cache(n)
+        return self.__generation_round_fw_no_cache(n)
+
+    def __generation_round_kv_cache(self, n: int) -> list[dict[str, Any]]:
+        """Generate n self-play games using KV cache. Faster per step, higher VRAM."""
         boards = [chess.Board() for _ in range(n)]
         move_history = [[self.__tokenizer.BOS] for _ in range(n)]
         kv_caches = [KVCache() for _ in range(n)]
-        active = list(range(n))  # indices of unfinished games
+        active = list(range(n))
         max_moves = self.__config.max_moves
         results: list[dict[str, Any]] = []
 
         with torch.no_grad():
             while active:
-
-                # build input tensor from active games only
                 latest_tokens = torch.tensor(
                     [[move_history[i][-1]] for i in active],
                     dtype=torch.long,
                     device=self.__device,
                 )  # [n_active, 1]
 
-                # run one step per active game using its own cache
                 next_logits_list = []
-
                 for idx, game_idx in enumerate(active):
                     token = latest_tokens[idx].unsqueeze(0)  # [1, 1]
                     logits, _, new_cache = self.__model.generate_step(
@@ -397,7 +428,7 @@ class ChessTrainer:
                         kv_caches[game_idx],
                     )
                     next_logits_list.append(logits[0, 0])  # [vocab_size]
-                    kv_caches[game_idx] = new_cache  # free old cache immediately
+                    kv_caches[game_idx] = new_cache
 
                 still_active = []
                 for idx, game_idx in enumerate(active):
@@ -406,7 +437,6 @@ class ChessTrainer:
                     masked_logits = next_logits_list[idx] + legal_mask
                     probs = F.softmax(masked_logits, dim=-1)
 
-                    # if model outputs NaN, fall back to uniform distribution over legal moves
                     if torch.isnan(probs).any() or torch.isinf(probs).any():
                         legal_indices = (legal_mask == 0.0).nonzero(as_tuple=True)[0]
                         token_id = legal_indices[torch.randint(len(legal_indices), (1,))].item()
@@ -425,6 +455,70 @@ class ChessTrainer:
                         if game is not None:
                             results.append(game)
                         kv_caches[game_idx] = None  # type: ignore
+                    else:
+                        still_active.append(game_idx)
+
+                active = still_active
+
+        return results
+
+    def __generation_round_fw_no_cache(self, n: int) -> list[dict[str, Any]]:
+        """Generate n self-play games using full forward recompute. Higher compute, lower VRAM."""
+        boards = [chess.Board() for _ in range(n)]
+        move_history = [[self.__tokenizer.BOS] for _ in range(n)]
+        active = list(range(n))
+        max_moves = self.__config.max_moves
+        results: list[dict[str, Any]] = []
+
+        with torch.no_grad():
+            while active:
+                # build full sequence for each active game — recompute attention from scratch
+                max_len = max(len(move_history[i]) for i in active)
+                input_ids = torch.full(
+                    (len(active), max_len),
+                    fill_value=self.__tokenizer.PAD,
+                    dtype=torch.long,
+                    device=self.__device,
+                )
+                for idx, game_idx in enumerate(active):
+                    seq = move_history[game_idx]
+                    input_ids[idx, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=self.__device)
+
+                attention_mask = (input_ids != self.__tokenizer.PAD)
+                padding_mask = make_padding_mask(attention_mask).to(self.__device)
+                causal_mask = make_causal_mask(max_len, self.__device)
+
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
+                    logits, _ = self.__model(input_ids, causal_mask + padding_mask)
+
+                # extract logits at the last real token position for each game
+                seq_lens = attention_mask.sum(dim=1) - 1  # index of last token
+                next_logits_list = [logits[idx, seq_lens[idx]] for idx in range(len(active))]
+
+                still_active = []
+                for idx, game_idx in enumerate(active):
+                    board = boards[game_idx]
+                    legal_mask = self.__tokenizer.get_legal_mask(board).to(self.__device)
+                    masked_logits = next_logits_list[idx] + legal_mask
+                    probs = F.softmax(masked_logits, dim=-1)
+
+                    if torch.isnan(probs).any() or torch.isinf(probs).any():
+                        legal_indices = (legal_mask == 0.0).nonzero(as_tuple=True)[0]
+                        token_id = legal_indices[torch.randint(len(legal_indices), (1,))].item()
+                    else:
+                        token_id = torch.multinomial(probs, num_samples=1).item()
+
+                    move = self.__tokenizer.decode_move(int(token_id))
+                    if move is None:
+                        raise RuntimeError(f"unexpected move: {move}")
+
+                    board.push(move)
+                    move_history[game_idx].append(int(token_id))
+
+                    if board.is_game_over() or len(move_history[game_idx]) >= max_moves:
+                        game = self.__extract_game(boards[game_idx], move_history[game_idx])
+                        if game is not None:
+                            results.append(game)
                     else:
                         still_active.append(game_idx)
 
@@ -484,7 +578,7 @@ class ChessTrainer:
         evaluator = (
             AsyncBatchEvaluator(
                 stockfish_path=self.__config.stockfish_path,
-                depth=self.__config.stockfish_depth,
+                depth=self.__selfplay_stockfish_depth,
                 temperature=self.__config.advantage_temperature,
                 n_workers=self.__config.stockfish_workers,
             )
@@ -751,11 +845,25 @@ class ChessTrainer:
     # Main loop
     #
 
-    def run(self, max_epochs: int | None = None) -> None:
+    def run(
+        self,
+        max_epochs: int | None = None,
+        disable_selfplay: bool = False,
+        self_play_min: float | None = None,
+        self_play_max: float | None = None,
+        self_play_stockfish_depth: int = 5,
+    ) -> None:
         print(f"training on {self.__config.device}")
         print(f"model parameters: {sum(p.numel() for p in self.__model.parameters()):,}")
 
         end_epoch = min(self.__start_epoch + max_epochs, self.__config.n_epochs) if max_epochs else self.__config.n_epochs
+
+        self.__disable_selfplay = disable_selfplay
+        self.__selfplay_min_override = self_play_min
+        self.__selfplay_max_override = self_play_max
+        self.__selfplay_stockfish_depth = self_play_stockfish_depth
+        self.__run_start_epoch = self.__start_epoch
+        self.__run_end_epoch = end_epoch
 
         loss = 0.0
         value_loss = 0.0
@@ -798,7 +906,6 @@ class ChessTrainer:
         self.writer.close()
         if self.__evaluator is not None:
             self.__evaluator.close()
-        self.save_model(Path(".") / "env" / "out" / self.__config.model_name)
 
     #
     # Logging
