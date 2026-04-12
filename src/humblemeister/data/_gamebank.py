@@ -26,12 +26,9 @@ import torch.nn.functional as F
 try:
     import ipywidgets as widgets
     from IPython.display import display as _display
-
-    _WIDGETS_AVAILABLE = True
 except ImportError:
     widgets = None
     _display = None  # type: ignore[assignment]
-    _WIDGETS_AVAILABLE = False
 
 
 _SHARD_SIZE = 1000  # games per shard file
@@ -270,12 +267,12 @@ class ChessGameBank:
         total_lines = len(content)
         bar = (
             widgets.IntProgress(min=0, max=max(total_lines, 1), description="Parsing:")
-            if _WIDGETS_AVAILABLE
+            if widgets is not None
             else None
         )
         status = (
             widgets.HTML(value=f"<small>0 / {total_lines:,} lines</small>")
-            if _WIDGETS_AVAILABLE
+            if widgets is not None
             else None
         )
         if bar is not None and status is not None:
@@ -317,10 +314,10 @@ class ChessGameBank:
         total_files = len(archive_files)
         bar = (
             widgets.IntProgress(min=0, max=max(total_files, 1), description="Loading:")
-            if _WIDGETS_AVAILABLE
+            if widgets is not None
             else None
         )
-        status = widgets.HTML(value="") if _WIDGETS_AVAILABLE else None
+        status = widgets.HTML(value="") if widgets is not None else None
         if bar is not None and status is not None:
             _display(widgets.HBox([bar, status]))  # type: ignore[no-untyped-call]
 
@@ -401,12 +398,12 @@ class ChessGameBank:
 
         bar = (
             widgets.IntProgress(min=0, max=n_shards, description="Evaluating:")
-            if _WIDGETS_AVAILABLE
+            if widgets is not None
             else None
         )
         status = (
             widgets.HTML(value=f"<small>0 / {n_shards} shards</small>")
-            if _WIDGETS_AVAILABLE
+            if widgets is not None
             else None
         )
         if bar is not None and status is not None:
@@ -512,12 +509,12 @@ class ChessGameBank:
 
         bar = (
             widgets.IntProgress(min=0, max=n_shards, description="Filling:")
-            if _WIDGETS_AVAILABLE
+            if widgets is not None
             else None
         )
         status = (
             widgets.HTML(value=f"<small>0 / {n_shards} shards</small>")
-            if _WIDGETS_AVAILABLE
+            if widgets is not None
             else None
         )
         if bar is not None and status is not None:
@@ -605,12 +602,12 @@ class ChessGameBank:
 
         bar = (
             widgets.IntProgress(min=0, max=max(len(shards), 1), description="Saving:")
-            if _WIDGETS_AVAILABLE
+            if widgets is not None
             else None
         )
         status = (
             widgets.HTML(value=f"<small>0 / {len(shards)} shards</small>")
-            if _WIDGETS_AVAILABLE
+            if widgets is not None
             else None
         )
         if bar is not None and status is not None:
@@ -646,12 +643,12 @@ class ChessGameBank:
 
         bar = (
             widgets.IntProgress(min=0, max=max(n_shards, 1), description="Loading:")
-            if _WIDGETS_AVAILABLE
+            if widgets is not None
             else None
         )
         status = (
             widgets.HTML(value=f"<small>0 / {n_shards} shards</small>")
-            if _WIDGETS_AVAILABLE
+            if widgets is not None
             else None
         )
         if bar is not None and status is not None:

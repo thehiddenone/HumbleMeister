@@ -8,9 +8,9 @@ import chess.svg
 import torch
 
 from .attention import KVCache
+from .config import ChessTrainingConfig
 from .data import ChessTokenizer
 from .inference import sample_move, sample_move_kv_cache
-from .trainer import ChessTrainingConfig
 from .transformer import ChessTransformer
 
 
@@ -33,9 +33,20 @@ class ChessEngine:
         tokenizer: ChessTokenizer,
         device: str = "cpu",
         temperature: float = 1.0,
-        value_weight: float = 0.0,
+        value_weight: float = 1.0,
         use_kv_cache: bool = True,
     ) -> None:
+        """
+        Args:
+            model:        trained ChessTransformer; will be moved to device.
+            tokenizer:    tokenizer matching the model's vocabulary.
+            device:       torch device string — "cpu", "cuda", "cuda:0", etc.
+            temperature:  softmax temperature for move sampling; <1 = sharper, >1 = more random.
+            value_weight: blend policy logits with value head output.
+                          0.0 = pure policy; higher values shift selection toward value-guided moves.
+            use_kv_cache: reuse K/V from previous moves each turn; faster per-step but holds the
+                          cache in memory for the duration of the game.
+        """
         self.__model = model.to(device)
         self.__tokenizer = tokenizer
         self.__device = torch.device(device)
@@ -96,8 +107,9 @@ class ChessEngine:
         value_weight: float = 0.0,
         use_kv_cache: bool = False,
     ) -> ChessEngine:
-        checkpoint = torch.load(path, map_location=device)
-        config = checkpoint["config"]
+        checkpoint = torch.load(path, map_location=device, weights_only=True)
+        config_data = checkpoint["config"]
+        config = ChessTrainingConfig(**config_data) if isinstance(config_data, dict) else config_data
         tokenizer = ChessTokenizer()
         model = cls._build_model(config, tokenizer)
         model.load_state_dict(checkpoint["model_state"])
@@ -185,7 +197,9 @@ class ChessEngine:
         self.__board.push(move)
         self.__move_history.append(self.__tokenizer.encode_move(move))
 
-    def move(self, player_move: chess.Move | str | None = None) -> chess.Board:
+    def move(
+        self, player_move: chess.Move | str | None = None
+    ) -> tuple[chess.Board, chess.Move | None]:
         """
         Play one full turn.
 
@@ -199,7 +213,7 @@ class ChessEngine:
         """
         if self.__board.is_game_over():
             print(f"game over — {self.__board.result()}")
-            return self.__board
+            return self.__board, None
 
         if player_move is None:
             # self-play: model plays whoever's turn it is
@@ -208,7 +222,7 @@ class ChessEngine:
             self.apply_move(model_move)
             if self.__board.is_game_over():
                 print(f"game over — {self.__board.result()}")
-            return self.__board
+            return self.__board, model_move
 
         # player's move
         if isinstance(player_move, str):
@@ -216,7 +230,7 @@ class ChessEngine:
         self.apply_move(player_move)
         if self.__board.is_game_over():
             print(f"game over — {self.__board.result()}")
-            return self.__board
+            return self.__board, None
 
         # model responds
         model_move = self.sample_move()
@@ -225,7 +239,7 @@ class ChessEngine:
         if self.__board.is_game_over():
             print(f"game over — {self.__board.result()}")
 
-        return self.__board
+        return self.__board, model_move
 
     def start_game(self, player_color: chess.Color = chess.WHITE) -> chess.Board:
         """Reset the board and set which color the player controls.

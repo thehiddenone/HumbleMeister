@@ -24,7 +24,7 @@ def _resolve_path(model_name: str) -> str:
 def _get_engine(model_name: str) -> ChessEngine:
     if model_name not in _engines:
         path = _resolve_path(model_name)
-        _engines[model_name] = ChessEngine.load(path, device="cpu")
+        _engines[model_name] = ChessEngine.load(path, device="cpu", value_weight=1.0, use_kv_cache=True)
     return _engines[model_name]
 
 
@@ -48,7 +48,7 @@ def start_game(model_name: str, color_choice: str) -> tuple[str, str, str]:
 
 
 def play_move(
-    model_name: str, color_choice: str, san_input: str
+    model_name: str, color_choice: str, move_input: str
 ) -> tuple[str, str, str]:
     """Called when the player submits a move."""
     if not model_name:
@@ -60,11 +60,20 @@ def play_move(
     if engine.board.is_game_over():
         return _board_svg(engine.board, player_color), color_choice, f"Game over — {engine.board.result()}. Start a new game."
 
-    # parse SAN
+    # parse UCI or SAN
+    text = move_input.strip()
+    move = None
     try:
-        move = engine.board.parse_san(san_input.strip())
+        candidate = chess.Move.from_uci(text)
+        if candidate in engine.board.legal_moves:
+            move = candidate
     except ValueError:
-        return _board_svg(engine.board, player_color), color_choice, f"Invalid move: '{san_input}'. Please use SAN notation (e.g. e4, Nf3, O-O)."
+        pass
+    if move is None:
+        try:
+            move = engine.board.parse_san(text)
+        except ValueError:
+            return _board_svg(engine.board, player_color), color_choice, f"Invalid move: '{text}'. Use UCI (e.g. e2e4) or SAN (e.g. e4, Nf3, O-O)."
 
     # apply player move
     engine.apply_move(move)
@@ -74,15 +83,31 @@ def play_move(
 
     # model responds
     model_move = engine.sample_move()
+    model_san = engine.board.san(model_move)
     engine.apply_move(model_move)
-    model_san = engine.board.san(model_move) if engine.board.move_stack else model_move.uci()
 
     if engine.board.is_game_over():
-        status = f"Model played {model_move.uci()}. Game over — {engine.board.result()}"
+        status = f"Model played {model_san}. Game over — {engine.board.result()}"
     else:
-        status = f"Model played {model_move.uci()}. Your turn."
+        status = f"Model played {model_san}. Your turn."
 
     return _board_svg(engine.board, player_color), color_choice, status
+
+
+def suggest_move(model_name: str, color_choice: str) -> tuple[str, str, str]:
+    """Sample a move from the engine without applying it."""
+    if not model_name:
+        return "", color_choice, "Please select a model and start a game first."
+
+    engine = _get_engine(model_name)
+    player_color = chess.WHITE if color_choice == "White" else chess.BLACK
+
+    if engine.board.is_game_over():
+        return _board_svg(engine.board, player_color), color_choice, f"Game over — {engine.board.result()}. Start a new game."
+
+    suggested = engine.sample_move()
+    suggested_san = engine.board.san(suggested)
+    return _board_svg(engine.board, player_color), color_choice, f"HumbleMeister suggested: {suggested_san} ({suggested.uci()})"
 
 
 with gr.Blocks(title="HumbleMeister Chess") as demo:
@@ -106,11 +131,13 @@ with gr.Blocks(title="HumbleMeister Chess") as demo:
 
     with gr.Row():
         move_input = gr.Textbox(
-            label="Your move (SAN notation, e.g. e4, Nf3, O-O)",
-            placeholder="e4",
+            label="Your move (UCI e.g. e2e4, or SAN e.g. e4, Nf3, O-O)",
+            placeholder="e2e4",
             scale=4,
         )
-        move_btn = gr.Button("Play", variant="primary", scale=1)
+        with gr.Column(scale=1, min_width=80):
+            move_btn = gr.Button("Play", variant="primary")
+            suggest_btn = gr.Button("Help me, I need advice")
 
     # hidden state to carry color across calls
     color_state = gr.State("White")
@@ -130,6 +157,12 @@ with gr.Blocks(title="HumbleMeister Chess") as demo:
     move_input.submit(
         fn=play_move,
         inputs=[model_dropdown, color_state, move_input],
+        outputs=[board_svg, color_state, status_box],
+    )
+
+    suggest_btn.click(
+        fn=suggest_move,
+        inputs=[model_dropdown, color_state],
         outputs=[board_svg, color_state, status_box],
     )
 

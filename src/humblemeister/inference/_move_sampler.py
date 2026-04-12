@@ -51,7 +51,7 @@ def sample_move(
     input_ids = torch.tensor([move_history], dtype=torch.long, device=device)  # [1, seq_len]
 
     with torch.no_grad():
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16 and device.type == "cuda"):
             logits, _ = model(input_ids, is_causal=True)
 
     policy_logits = logits[0, -1].clone() / temperature  # [vocab_size]
@@ -80,7 +80,7 @@ def sample_move(
         )  # [n_legal, seq_len+1]
 
         with torch.no_grad():
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16 and device.type == "cuda"):
                 value_logits, value_preds = model(value_input, is_causal=True)
         del value_logits, value_input
         # value_preds: [n_legal, seq_len+1] — take the last position
@@ -173,7 +173,7 @@ def sample_move_kv_cache(
 
     logits: torch.Tensor | None = None
     with torch.no_grad():
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16 and device.type == "cuda"):
             for token_id in tokens_to_process:
                 token = torch.tensor([[token_id]], dtype=torch.long, device=device)  # [1, 1]
                 logits, _, cache = model.generate_step(token, cache)
@@ -212,7 +212,7 @@ def sample_move_kv_cache(
         # one generate_step over all legal move tokens at once
         move_tokens = legal_token_ids.unsqueeze(1)  # [n_legal, 1]
         with torch.no_grad():
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16 and device.type == "cuda"):
                 _, value_preds, _ = model.generate_step(move_tokens, expanded_cache)
         # value_preds: [n_legal, 1] → squeeze to [n_legal]
         value_scores = value_preds.squeeze(1)

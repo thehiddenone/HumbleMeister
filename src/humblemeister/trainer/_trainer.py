@@ -4,13 +4,11 @@ import json
 import math
 import os
 import shutil
-import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
-import chess
 import safetensors.torch as st
 import torch
 import torch.nn.functional as F
@@ -18,31 +16,16 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
-from humblemeister.attention import KVCache, LayerKVCache, make_causal_mask, make_padding_mask
+from humblemeister.attention import make_causal_mask, make_padding_mask
+from humblemeister.config import ChessTrainingConfig
 from humblemeister.data import ChessDataset, ChessGameBank, ChessTokenizer, GameRecord
-from humblemeister.evaluation import AsyncBatchEvaluator, StockfishEvaluator, compute_move_weights
+from humblemeister.evaluation import StockfishEvaluator, compute_move_weights
 from humblemeister.transformer import ChessTransformer
 
 from ._loss_tracker import LossBreakthroughDetector
-
-
-def _save_temp_batch(batch: list[dict[str, Any]]) -> Path:
-    """Write a list of game dicts to a temp file and return its path."""
-    fd, path_str = tempfile.mkstemp(suffix=".pt", prefix="chess_sp_")
-    os.close(fd)
-    path = Path(path_str)
-    torch.save(batch, path)
-    return path
-
-
-def get_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.mps.is_available():
-        return "mps"
-    return "cpu"
+from ._self_play_gpu import SelfPlayGPU
 
 
 def get_scheduler(
@@ -57,158 +40,6 @@ def get_scheduler(
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return LambdaLR(optimizer, lr_lambda)
-
-
-@dataclass
-class ChessTrainingConfig:
-    model_name: str
-
-    # model: tiny
-    d_model: int = 128
-    n_heads: int = 4
-    n_layers: int = 4
-    d_ff: int = 512
-    train_batch_size: int = 256
-
-    max_seq_len: int = 512
-    dropout: float = 0.1
-    bf16: bool = True  # bfloat16 mixed precision — halves activation memory, no GradScaler needed
-
-    # training
-    n_games: int = 512  # total games loaded per epoch
-    n_epochs: int = 2000
-    lr: float = 3e-4
-    device: str = get_device()
-
-    max_moves: int = 500
-    warmup_epochs: int = 50
-    outcome_warmup: int = 20000
-
-    # self-play curriculum — ramps in gradually after self_play_start_epoch
-    self_play_start_epoch: int = 1000  # all bank games before this
-    self_play_ramp_epochs: int = 400  # epochs to ramp from 0% → max ratio
-    self_play_max_ratio: float = 0.1  # cap at 30% self-play games
-    self_play_batch_size: int = 64  # games per generation sub-batch
-
-    # stockfish evaluation
-    use_stockfish: bool = True
-    stockfish_path: str = "stockfish"
-    stockfish_depth: int = 5  # depth 5 ≈ 1-5ms/position
-    stockfish_workers: int = 24  # parallel engine processes for board evaluation
-    advantage_temperature: float = 1.0  # sharpness of per-move weight distribution
-    value_loss_weight: float = 0.5  # relative weight of value loss vs policy loss
-    self_play_kv_cache: bool = True  # use KV cache during self-play generation
-    self_play_value_weight: float = 0.5  # weight for value-blended move selection during self-play
-    self_play_max_moves: int = 120  # hard draw cap for self-play games
-    streaming: bool = False  # stream games in chunks instead of generating all at once
-    streaming_chunk_size: int = 64  # games per streaming chunk (generation + grad accumulation)
-
-    # checkpointing
-    checkpoint_dir: str = "env/checkpoints"
-    checkpoint_every: int = 50  # save every N epochs
-    keep_last_n: int = 10  # keep only the last N checkpoints
-
-    # logging
-    log_dir: str = "env/logs"
-    log_every: int = 1
-
-    @classmethod
-    def tiny(cls, name: str) -> ChessTrainingConfig:
-        result = cls(name)
-        result.d_model = 128
-        result.n_heads = 4
-        result.n_layers = 4
-        result.d_ff = 512
-        result.train_batch_size = 512
-        return result
-
-    @classmethod
-    def small(cls, name: str) -> ChessTrainingConfig:
-        result = cls(name)
-        result.d_model = 256
-        result.n_heads = 4
-        result.n_layers = 4
-        result.d_ff = 1024
-        result.train_batch_size = 512
-        return result
-
-    @classmethod
-    def medium(cls, name: str) -> ChessTrainingConfig:
-        result = cls(name)
-        result.d_model = 512
-        result.n_heads = 8
-        result.n_layers = 8
-        result.d_ff = 2048
-        result.train_batch_size = 256
-        result.n_games = 1024
-        return result
-
-    @classmethod
-    def large(cls, name: str) -> ChessTrainingConfig:
-        result = cls(name)
-        result.d_model = 768
-        result.n_heads = 12
-        result.n_layers = 12
-        result.d_ff = 3072
-        result.train_batch_size = 64
-        result.n_games = 2048
-        return result
-
-    @classmethod
-    def huge(cls, name: str) -> ChessTrainingConfig:
-        result = cls(name)
-        result.d_model = 1024
-        result.n_heads = 16
-        result.n_layers = 16
-        result.d_ff = 4096
-        result.train_batch_size = 64
-        result.n_games = 2048
-        return result
-
-    @classmethod
-    def giant(cls, name: str) -> ChessTrainingConfig:
-        result = cls(name)
-        result.d_model = 1536
-        result.n_heads = 24
-        result.n_layers = 24
-        result.d_ff = 6144
-        result.train_batch_size = 4
-        result.self_play_kv_cache = False
-        result.streaming = True
-        result.streaming_chunk_size = 12
-        result.n_games = 4096
-        return result
-
-    @classmethod
-    def uber(cls, name: str) -> ChessTrainingConfig:
-        result = cls(name)
-        result.d_model = 2048
-        result.n_heads = 32
-        result.n_layers = 32
-        result.d_ff = 8192
-        result.train_batch_size = 2
-        result.streaming = True
-        result.streaming_chunk_size = 64
-        result.n_games = 8192
-        return result
-
-    def save(self, file_path: str | Path) -> None:
-        with Path(file_path).open(mode="w") as f:
-            json.dump(asdict(self), f)
-
-    @classmethod
-    def from_file(cls, file_path: str | Path) -> ChessTrainingConfig:
-        with Path(file_path).open() as f:
-            d = json.load(f)
-            if not isinstance(d, dict):
-                raise TypeError(
-                    f"Cannot load ChessTrainingConfig: expected dict, got {type(d).__name__}"
-                )
-            if "model_name" not in d:
-                raise ValueError(f"Cannot load ChessTrainingConfig: model_name is not defined")
-            model_name = d["model_name"]
-            del d["model_name"]
-            return cls(model_name, **d)
 
 
 class ChessTrainer:
@@ -227,6 +58,7 @@ class ChessTrainer:
     __selfplay_max_override: float | None
     __run_start_epoch: int
     __run_end_epoch: int
+    __self_play: SelfPlayGPU
     __sp_gen_time_s: float
     __sp_eval_time_s: float
     __sp_games_generated: int
@@ -242,8 +74,6 @@ class ChessTrainer:
         self.__disable_selfplay = False
         self.__selfplay_min_override: float | None = None
         self.__selfplay_max_override: float | None = None
-        self.__selfplay_stockfish_depth: int = config.stockfish_depth
-        self.__selfplay_value_weight: float = config.self_play_value_weight
         self.__run_start_epoch = 0
         self.__run_end_epoch = config.n_epochs
         self.__tokenizer = ChessTokenizer()
@@ -253,6 +83,15 @@ class ChessTrainer:
             StockfishEvaluator(config.stockfish_path, config.stockfish_workers)
             if config.use_stockfish
             else None
+        )
+        self.__self_play = SelfPlayGPU(
+            batch_size=config.self_play_batch_size,
+            max_moves=config.self_play_max_moves,
+            value_weight=config.self_play_value_weight,
+            stockfish_path=config.stockfish_path,
+            stockfish_depth=config.stockfish_depth,
+            stockfish_workers=config.stockfish_workers,
+            advantage_temperature=config.advantage_temperature,
         )
 
         self.__model = ChessTransformer(
@@ -299,7 +138,7 @@ class ChessTrainer:
             torch.save(
                 {
                     "model_state": self.__model.state_dict(),
-                    "config": self.__config,
+                    "config": asdict(self.__config),
                     "vocab_size": self.__tokenizer.vocab_size,
                 },
                 path,
@@ -419,398 +258,22 @@ class ChessTrainer:
                 )
             )
 
-    def __generation_round(self, n: int) -> list[dict[str, Any]]:
-        """Dispatch to KV-cache or full-recompute generation based on config."""
-        if self.__config.self_play_kv_cache:
-            return self.__generation_round_kv_cache(n)
-        return self.__generation_round_fw_no_cache(n)
-
-    def __generation_round_kv_cache(self, n: int) -> list[dict[str, Any]]:
-        """Generate n self-play games using a single joint KV cache.
-
-        All active games share one [n_active, ...] cache tensor, so each step
-        costs one batched generate_step call instead of n_active serial calls.
-
-        When value_weight > 0, torch.repeat_interleave expands the joint cache
-        into a flat [total_legal_moves, ...] batch so all legal-move value
-        scores across all active games are computed in a single generate_step.
-
-        When games complete, their rows are removed from the joint cache via
-        index selection before advancing to the next step.
-        """
-        boards = [chess.Board() for _ in range(n)]
-        move_history = [[self.__tokenizer.BOS] for _ in range(n)]
-        active = list(range(n))
-        max_moves = self.__config.self_play_max_moves
-        value_weight = self.__selfplay_value_weight
-        results: list[dict[str, Any]] = []
-
-        # ------------------------------------------------------------ #
-        # Prefill: process BOS for all n games in one batched call      #
-        # ------------------------------------------------------------ #
-        bos = torch.full((n, 1), self.__tokenizer.BOS, dtype=torch.long, device=self.__device)
-        with torch.no_grad():
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
-                logits, _, joint_cache = self.__model.generate_step(bos, KVCache())
-        policy_logits = logits[:, 0, :]  # [n, vocab_size]
-
-        while active:
-            n_active = len(active)
-
-            # -------------------------------------------------------- #
-            # Enumerate legal moves and slice policy scores per game    #
-            # -------------------------------------------------------- #
-            legal_moves_per_game: list[list[chess.Move]] = []
-            legal_ids_per_game: list[torch.Tensor] = []
-            legal_policy_per_game: list[torch.Tensor] = []
-
-            for local_idx, game_idx in enumerate(active):
-                legal = list(boards[game_idx].legal_moves)
-                legal_moves_per_game.append(legal)
-                ids = torch.tensor(
-                    [self.__tokenizer.encode_move(m) for m in legal],
-                    dtype=torch.long,
-                    device=self.__device,
-                )
-                legal_ids_per_game.append(ids)
-                legal_policy_per_game.append(policy_logits[local_idx][ids])
-
-            # -------------------------------------------------------- #
-            # Value scoring: one big generate_step (when λ > 0)        #
-            # repeat_interleave expands each game's cache row           #
-            # n_legal_i times, matching the flat legal-move token list  #
-            # -------------------------------------------------------- #
-            if value_weight > 0.0:
-                counts = [len(ids) for ids in legal_ids_per_game]
-                repeats = torch.tensor(counts, dtype=torch.long, device=self.__device)
-
-                flat_cache = KVCache(
-                    layers=[
-                        LayerKVCache(
-                            k=torch.repeat_interleave(layer.k, repeats, dim=0),
-                            v=torch.repeat_interleave(layer.v, repeats, dim=0),
-                        )
-                        for layer in joint_cache.layers
-                    ]
-                )
-                value_tokens = torch.cat(legal_ids_per_game).unsqueeze(1)  # [total_legal, 1]
-
-                with torch.no_grad():
-                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
-                        _, value_preds, _ = self.__model.generate_step(value_tokens, flat_cache)
-                value_flat = value_preds[:, 0]  # [total_legal]
-
-                offset = 0
-                final_scores_per_game: list[torch.Tensor] = []
-                for local_idx, game_idx in enumerate(active):
-                    n_legal = counts[local_idx]
-                    v = value_flat[offset : offset + n_legal]
-                    if boards[game_idx].turn == chess.BLACK:
-                        v = -v
-                    final_scores_per_game.append(
-                        legal_policy_per_game[local_idx] + value_weight * v
-                    )
-                    offset += n_legal
-            else:
-                final_scores_per_game = legal_policy_per_game
-
-            # -------------------------------------------------------- #
-            # Sample, advance boards, collect completed games           #
-            # -------------------------------------------------------- #
-            sampled_tokens: list[int] = []
-            still_active: list[int] = []
-            keep_local: list[int] = []  # local indices to retain in joint cache
-
-            for local_idx, game_idx in enumerate(active):
-                board = boards[game_idx]
-                legal = legal_moves_per_game[local_idx]
-                probs = F.softmax(final_scores_per_game[local_idx], dim=0)
-
-                if torch.isnan(probs).any() or torch.isinf(probs).any():
-                    move_idx = int(torch.randint(len(legal), (1,)).item())
-                else:
-                    move_idx = int(torch.multinomial(probs, num_samples=1).item())
-
-                move = legal[move_idx]
-                board.push(move)
-                token = self.__tokenizer.encode_move(move)
-                move_history[game_idx].append(token)
-
-                if board.is_game_over() or len(move_history[game_idx]) >= max_moves:
-                    game = self.__extract_game(boards[game_idx], move_history[game_idx])
-                    if game is not None:
-                        results.append(game)
-                else:
-                    still_active.append(game_idx)
-                    sampled_tokens.append(token)
-                    keep_local.append(local_idx)
-
-            active = still_active
-            if not active:
-                break
-
-            # -------------------------------------------------------- #
-            # Drop completed games from the joint cache                 #
-            # -------------------------------------------------------- #
-            if len(keep_local) < n_active:
-                joint_cache = KVCache(
-                    layers=[
-                        LayerKVCache(k=layer.k[keep_local], v=layer.v[keep_local])
-                        for layer in joint_cache.layers
-                    ]
-                )
-
-            # -------------------------------------------------------- #
-            # Advance joint cache with sampled moves → next policy      #
-            # -------------------------------------------------------- #
-            token_tensor = torch.tensor(
-                sampled_tokens, dtype=torch.long, device=self.__device
-            ).unsqueeze(
-                1
-            )  # [n_still_active, 1]
-
-            with torch.no_grad():
-                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
-                    logits, _, joint_cache = self.__model.generate_step(token_tensor, joint_cache)
-            policy_logits = logits[:, 0, :]  # [n_still_active, vocab_size]
-
-        return results
-
-    def __generation_round_fw_no_cache(self, n: int) -> list[dict[str, Any]]:
-        """Generate n self-play games using batched full forward recompute.
-
-        At each step all active games have identical sequence lengths, so they
-        are stacked into a single [n_active, seq_len] tensor for one batched
-        forward pass instead of n_active separate passes.
-
-        When value_weight > 0, the value sequences (history + each legal move)
-        are also all the same length, so all legal moves across all games are
-        concatenated into one further batched forward pass.
-        """
-        boards = [chess.Board() for _ in range(n)]
-        move_history = [[self.__tokenizer.BOS] for _ in range(n)]
-        active = list(range(n))
-        max_moves = self.__config.self_play_max_moves
-        value_weight = self.__selfplay_value_weight
-        results: list[dict[str, Any]] = []
-
-        while active:
-            # -------------------------------------------------------- #
-            # Policy step: one forward pass for all active games        #
-            # -------------------------------------------------------- #
-            input_ids = torch.tensor(
-                [move_history[i] for i in active],
-                dtype=torch.long,
-                device=self.__device,
-            )  # [n_active, seq_len]
-
-            with torch.no_grad():
-                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
-                    logits, _ = self.__model(input_ids, is_causal=True)
-
-            policy_logits = logits[:, -1, :].clone()  # [n_active, vocab_size]
-            del logits, _
-
-            # -------------------------------------------------------- #
-            # Per-game: enumerate legal moves, slice policy scores      #
-            # -------------------------------------------------------- #
-            legal_moves_per_game: list[list[chess.Move]] = []
-            legal_ids_per_game: list[torch.Tensor] = []
-            legal_policy_per_game: list[torch.Tensor] = []
-
-            for idx, game_idx in enumerate(active):
-                legal = list(boards[game_idx].legal_moves)
-                legal_moves_per_game.append(legal)
-                ids = torch.tensor(
-                    [self.__tokenizer.encode_move(m) for m in legal],
-                    dtype=torch.long,
-                    device=self.__device,
-                )
-                legal_ids_per_game.append(ids)
-                legal_policy_per_game.append(policy_logits[idx][ids])
-
-            # -------------------------------------------------------- #
-            # Value step: one big batched forward pass (when λ > 0)    #
-            # All value sequences are length seq_len+1 — same length   #
-            # for every (game, legal_move) pair.                        #
-            # -------------------------------------------------------- #
-            if value_weight > 0.0:
-                value_seqs: list[list[int]] = []
-                counts: list[int] = []
-                for idx, game_idx in enumerate(active):
-                    hist = move_history[game_idx]
-                    for tid in legal_ids_per_game[idx]:
-                        value_seqs.append(hist + [int(tid.item())])
-                    counts.append(len(legal_ids_per_game[idx]))
-
-                value_input = torch.tensor(
-                    value_seqs, dtype=torch.long, device=self.__device
-                )  # [total_legal, seq_len+1]
-
-                with torch.no_grad():
-                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
-                        value_logits, value_preds = self.__model(value_input, is_causal=True)
-                del value_logits, value_input
-
-                value_flat = value_preds[:, -1].clone()  # [total_legal]
-                del value_preds
-
-                offset = 0
-                final_scores_per_game: list[torch.Tensor] = []
-                for idx, game_idx in enumerate(active):
-                    n_legal = counts[idx]
-                    v = value_flat[offset : offset + n_legal]
-                    if boards[game_idx].turn == chess.BLACK:
-                        v = -v
-                    final_scores_per_game.append(legal_policy_per_game[idx] + value_weight * v)
-                    offset += n_legal
-            else:
-                final_scores_per_game = legal_policy_per_game
-
-            # -------------------------------------------------------- #
-            # Sample and advance each game                              #
-            # -------------------------------------------------------- #
-            still_active = []
-            for idx, game_idx in enumerate(active):
-                board = boards[game_idx]
-                legal = legal_moves_per_game[idx]
-                probs = F.softmax(final_scores_per_game[idx], dim=0)
-
-                if torch.isnan(probs).any() or torch.isinf(probs).any():
-                    move_idx = int(torch.randint(len(legal), (1,)).item())
-                else:
-                    move_idx = int(torch.multinomial(probs, num_samples=1).item())
-
-                move = legal[move_idx]
-                board.push(move)
-                move_history[game_idx].append(self.__tokenizer.encode_move(move))
-
-                if board.is_game_over() or len(move_history[game_idx]) >= max_moves:
-                    game = self.__extract_game(boards[game_idx], move_history[game_idx])
-                    if game is not None:
-                        results.append(game)
-                else:
-                    still_active.append(game_idx)
-
-            active = still_active
-
-        return results
-
-    def __extract_game(self, board: chess.Board, token_history: list[int]) -> dict[str, Any] | None:
-        """Extract a completed self-play game into a serialisable dict, or None if invalid."""
-        result = board.result()  # "1-0", "0-1", "1/2-1/2", or "*" if max_moves reached
-        outcome = {"1-0": 1.0, "0-1": 0.0, "1/2-1/2": 0.5}.get(result, 0.5)
-
-        moves: list[chess.Move] = [
-            m
-            for t in token_history
-            if t not in (self.__tokenizer.BOS, self.__tokenizer.EOS, self.__tokenizer.PAD)
-            for m in (self.__tokenizer.decode_move(t),)
-            if m is not None
-        ]
-
-        if len(moves) > self.__config.max_moves:
-            return None
-
-        return {"moves": [m.uci() for m in moves], "outcome": outcome, "weights": None}
-
-    def __add_batch_to_dataset(self, batch_path: Path) -> None:
-        """Load an evaluated batch from a temp file, add games to the dataset, delete the file."""
-        data: list[dict[str, Any]] = torch.load(batch_path, weights_only=False)
-        batch_path.unlink()
-
-        for item in data:
-            moves_uci: list[str] = item.get("moves", [])
-            try:
-                moves = [chess.Move.from_uci(uci) for uci in moves_uci]
-                tensor = self.__tokenizer.encode_game_tensor(moves)
-            except Exception:
-                continue
-
-            self.__dataset.add_game(
-                GameRecord(
-                    moves=moves,
-                    outcome=float(item["outcome"]),
-                    tensor=tensor,
-                    move_weights=item.get("weights"),
-                )
-            )
-            self.__sp_games_included += 1
-
     def __generate_self_play(self, n_self_play: int) -> None:
-        """
-        Generate n_self_play games using async Stockfish evaluation.
-
-        Generation and evaluation overlap: while one batch is being evaluated
-        in a forked child process, the next batch is being generated on the GPU.
-        The number of concurrent forks is capped at stockfish_workers.
-        """
-        batch_size = self.__config.self_play_batch_size
-        evaluator = (
-            AsyncBatchEvaluator(
-                stockfish_path=self.__config.stockfish_path,
-                depth=self.__selfplay_stockfish_depth,
-                temperature=self.__config.advantage_temperature,
-                n_workers=self.__config.stockfish_workers,
+        """Generate n_self_play games via SelfPlay and add them to the dataset."""
+        t_gen = time.perf_counter()
+        self.__model.eval()
+        with tqdm(total=n_self_play, desc="self-play", unit="game", leave=False) as pbar:
+            records = self.__self_play.generate(
+                self.__model, self.__config, self.__tokenizer, n_self_play
             )
-            if self.__config.use_stockfish
-            else None
-        )
+            pbar.update(len(records))
+        self.__model.train()
+        self.__sp_gen_time_s += time.perf_counter() - t_gen
+        self.__sp_games_generated += len(records)
 
-        generated = 0
-        try:
-            while generated < n_self_play:
-                this_batch = min(batch_size, n_self_play - generated)
-                t_gen = time.perf_counter()
-                batch = self.__generation_round(this_batch)
-                self.__sp_gen_time_s += time.perf_counter() - t_gen
-
-                if not batch:
-                    continue
-                generated += len(batch)
-                self.__sp_games_generated += len(batch)
-
-                if evaluator is not None:
-                    # save to temp file and submit for async evaluation;
-                    # submit() may block here if the worker pool is full,
-                    # returning any batch that just finished as it yields a slot
-                    t_eval = time.perf_counter()
-                    completed = evaluator.submit(_save_temp_batch(batch))
-                    self.__sp_eval_time_s += time.perf_counter() - t_eval
-                    for path in completed:
-                        self.__add_batch_to_dataset(path)
-                else:
-                    # no Stockfish — add directly with no weights
-                    for item in batch:
-                        try:
-                            moves = [chess.Move.from_uci(uci) for uci in item["moves"]]
-                            tensor = self.__tokenizer.encode_game_tensor(moves)
-                            self.__dataset.add_game(
-                                GameRecord(
-                                    moves=moves,
-                                    outcome=float(item["outcome"]),
-                                    tensor=tensor,
-                                    move_weights=None,
-                                )
-                            )
-                            self.__sp_games_included += 1
-                        except Exception:
-                            continue
-
-            # drain any batches still being evaluated
-            if evaluator is not None:
-                t_eval = time.perf_counter()
-                for path in evaluator.drain():
-                    self.__add_batch_to_dataset(path)
-                self.__sp_eval_time_s += time.perf_counter() - t_eval
-
-            # keep memory under control
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-
-        finally:
-            if evaluator is not None:
-                evaluator.close()
+        for record in records:
+            self.__dataset.add_game(record)
+            self.__sp_games_included += 1
 
     def __run_epoch_streaming(
         self, epoch: int, n_bank: int, n_self_play: int, ratio: float
@@ -857,7 +320,12 @@ class ChessTrainer:
 
         self.__optimizer.zero_grad()
 
-        for b_this, sp_this in chunks: #tqdm(chunks, desc="chunks", leave=False):
+        sp_pbar = (
+            tqdm(total=n_self_play, desc="self-play", unit="game", leave=False)
+            if n_self_play > 0
+            else None
+        )
+        for b_this, sp_this in chunks:
             self.__dataset.clear()
 
             # ---------------------------------------------------------- #
@@ -870,40 +338,16 @@ class ChessTrainer:
 
             if sp_this > 0:
                 t_gen = time.perf_counter()
-                print(f'self-playing {sp_this} games')
-                sp_batch = self.__generation_round(sp_this)
+                records = self.__self_play.generate(
+                    self.__model, self.__config, self.__tokenizer, sp_this
+                )
                 self.__sp_gen_time_s += time.perf_counter() - t_gen
-                self.__sp_games_generated += len(sp_batch)
-
-                t_eval = time.perf_counter()
-                for item in sp_batch:
-                    try:
-                        moves = [chess.Move.from_uci(uci) for uci in item["moves"]]
-                        tensor = self.__tokenizer.encode_game_tensor(moves)
-                        weights: torch.Tensor | None = None
-                        if self.__evaluator is not None:
-                            weights = compute_move_weights(
-                                moves,
-                                self.__evaluator,
-                                self.__selfplay_stockfish_depth,
-                                self.__config.advantage_temperature,
-                            )
-                        self.__dataset.add_game(
-                            GameRecord(
-                                moves=moves,
-                                outcome=float(item["outcome"]),
-                                tensor=tensor,
-                                move_weights=weights,
-                            )
-                        )
-                        self.__sp_games_included += 1
-                    except Exception:
-                        continue
-                self.__sp_eval_time_s += time.perf_counter() - t_eval
-
-                # keep memory under control
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+                self.__sp_games_generated += len(records)
+                for record in records:
+                    self.__dataset.add_game(record)
+                    self.__sp_games_included += 1
+                if sp_pbar is not None:
+                    sp_pbar.update(len(records))
 
             if len(self.__dataset) == 0:
                 continue
@@ -984,6 +428,9 @@ class ChessTrainer:
                 total_loss += scaled_loss.item()
                 total_value_loss += value_loss_t.item()
                 total_mini_batches += 1
+
+        if sp_pbar is not None:
+            sp_pbar.close()
 
         if total_mini_batches == 0:
             print("warning: all mini-batches had NaN/inf loss, skipping update")
@@ -1252,16 +699,10 @@ class ChessTrainer:
         self.__disable_selfplay = disable_selfplay
         self.__selfplay_min_override = self_play_min
         self.__selfplay_max_override = self_play_max
-        self.__selfplay_stockfish_depth = (
-            self_play_stockfish_depth
-            if self_play_stockfish_depth is not None
-            else self.__config.stockfish_depth
-        )
-        self.__selfplay_value_weight = (
-            self_play_value_weight
-            if self_play_value_weight is not None
-            else self.__config.self_play_value_weight
-        )
+        if self_play_stockfish_depth is not None:
+            self.__self_play._stockfish_depth = self_play_stockfish_depth
+        if self_play_value_weight is not None:
+            self.__self_play._value_weight = self_play_value_weight
         self.__run_start_epoch = self.__start_epoch
         self.__run_end_epoch = end_epoch
 
@@ -1393,7 +834,7 @@ class ChessTrainer:
             return
 
         path = checkpoints[-1]
-        checkpoint = torch.load(path, map_location=self.__device)
+        checkpoint = torch.load(path, map_location=self.__device, weights_only=True)
 
         result = self.__model.load_state_dict(checkpoint["model_state"], strict=False)
         if result.missing_keys:
