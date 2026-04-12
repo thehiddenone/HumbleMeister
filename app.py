@@ -9,7 +9,7 @@ from humblemeister import ChessEngine
 
 # Add HF repos here
 MODEL_REGISTRY: dict[str, str] = {
-    # "Giant v1": "StanStanStan3141592/hmeister-giant-v1",
+    "preview_04072026_2000_b3": "StanStanStan3141592/hmeister_giant_04072026_2000_b3",
 }
 
 _engines: dict[str, ChessEngine] = {}
@@ -67,14 +67,14 @@ def play_move(
         return _board_svg(engine.board, player_color), color_choice, f"Invalid move: '{san_input}'. Please use SAN notation (e.g. e4, Nf3, O-O)."
 
     # apply player move
-    engine._apply_move(move)
+    engine.apply_move(move)
 
     if engine.board.is_game_over():
         return _board_svg(engine.board, player_color), color_choice, f"Game over — {engine.board.result()}"
 
     # model responds
-    model_move = engine._sample_move()
-    engine._apply_move(model_move)
+    model_move = engine.sample_move()
+    engine.apply_move(model_move)
     model_san = engine.board.san(model_move) if engine.board.move_stack else model_move.uci()
 
     if engine.board.is_game_over():

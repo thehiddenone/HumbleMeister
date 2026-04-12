@@ -20,10 +20,9 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from humblemeister.attention import KVCache, make_causal_mask, make_padding_mask
+from humblemeister.attention import KVCache, LayerKVCache, make_causal_mask, make_padding_mask
 from humblemeister.data import ChessDataset, ChessGameBank, ChessTokenizer, GameRecord
 from humblemeister.evaluation import AsyncBatchEvaluator, StockfishEvaluator, compute_move_weights
-from humblemeister.inference import sample_move
 from humblemeister.transformer import ChessTransformer
 
 from ._loss_tracker import LossBreakthroughDetector
@@ -88,7 +87,7 @@ class ChessTrainingConfig:
     # self-play curriculum — ramps in gradually after self_play_start_epoch
     self_play_start_epoch: int = 1000  # all bank games before this
     self_play_ramp_epochs: int = 400  # epochs to ramp from 0% → max ratio
-    self_play_max_ratio: float = 0.3  # cap at 30% self-play games
+    self_play_max_ratio: float = 0.1  # cap at 30% self-play games
     self_play_batch_size: int = 64  # games per generation sub-batch
 
     # stockfish evaluation
@@ -98,10 +97,11 @@ class ChessTrainingConfig:
     stockfish_workers: int = 24  # parallel engine processes for board evaluation
     advantage_temperature: float = 1.0  # sharpness of per-move weight distribution
     value_loss_weight: float = 0.5  # relative weight of value loss vs policy loss
-    self_play_kv_cache: bool = (
-        False  # use KV cache during self-play generation (faster but more VRAM)
-    )
-    self_play_value_weight: float = 0.0  # weight for value-blended move selection during self-play
+    self_play_kv_cache: bool = True  # use KV cache during self-play generation
+    self_play_value_weight: float = 0.5  # weight for value-blended move selection during self-play
+    self_play_max_moves: int = 120  # hard draw cap for self-play games
+    streaming: bool = False  # stream games in chunks instead of generating all at once
+    streaming_chunk_size: int = 64  # games per streaming chunk (generation + grad accumulation)
 
     # checkpointing
     checkpoint_dir: str = "env/checkpoints"
@@ -173,6 +173,9 @@ class ChessTrainingConfig:
         result.n_layers = 24
         result.d_ff = 6144
         result.train_batch_size = 4
+        result.self_play_kv_cache = False
+        result.streaming = True
+        result.streaming_chunk_size = 12
         result.n_games = 4096
         return result
 
@@ -184,6 +187,8 @@ class ChessTrainingConfig:
         result.n_layers = 32
         result.d_ff = 8192
         result.train_batch_size = 2
+        result.streaming = True
+        result.streaming_chunk_size = 64
         result.n_games = 8192
         return result
 
@@ -270,7 +275,9 @@ class ChessTrainer:
                 shutil.rmtree(self.checkpoints_path)
             os.makedirs(self.checkpoints_path, exist_ok=True)
 
-        self.writer = SummaryWriter(config.log_dir)
+        log_path = Path(config.log_dir) / self.__config.model_name
+        os.makedirs(log_path, exist_ok=True)
+        self.writer = SummaryWriter(log_path)
 
     def save_model(self, path: Path | None = None, safe: bool = True) -> None:
         if path is None:
@@ -419,85 +426,262 @@ class ChessTrainer:
         return self.__generation_round_fw_no_cache(n)
 
     def __generation_round_kv_cache(self, n: int) -> list[dict[str, Any]]:
-        """Generate n self-play games using KV cache. Faster per step, higher VRAM."""
+        """Generate n self-play games using a single joint KV cache.
+
+        All active games share one [n_active, ...] cache tensor, so each step
+        costs one batched generate_step call instead of n_active serial calls.
+
+        When value_weight > 0, torch.repeat_interleave expands the joint cache
+        into a flat [total_legal_moves, ...] batch so all legal-move value
+        scores across all active games are computed in a single generate_step.
+
+        When games complete, their rows are removed from the joint cache via
+        index selection before advancing to the next step.
+        """
         boards = [chess.Board() for _ in range(n)]
         move_history = [[self.__tokenizer.BOS] for _ in range(n)]
-        kv_caches = [KVCache() for _ in range(n)]
         active = list(range(n))
-        max_moves = self.__config.max_moves
+        max_moves = self.__config.self_play_max_moves
+        value_weight = self.__selfplay_value_weight
         results: list[dict[str, Any]] = []
 
+        # ------------------------------------------------------------ #
+        # Prefill: process BOS for all n games in one batched call      #
+        # ------------------------------------------------------------ #
+        bos = torch.full((n, 1), self.__tokenizer.BOS, dtype=torch.long, device=self.__device)
         with torch.no_grad():
-            while active:
-                latest_tokens = torch.tensor(
-                    [[move_history[i][-1]] for i in active],
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
+                logits, _, joint_cache = self.__model.generate_step(bos, KVCache())
+        policy_logits = logits[:, 0, :]  # [n, vocab_size]
+
+        while active:
+            n_active = len(active)
+
+            # -------------------------------------------------------- #
+            # Enumerate legal moves and slice policy scores per game    #
+            # -------------------------------------------------------- #
+            legal_moves_per_game: list[list[chess.Move]] = []
+            legal_ids_per_game: list[torch.Tensor] = []
+            legal_policy_per_game: list[torch.Tensor] = []
+
+            for local_idx, game_idx in enumerate(active):
+                legal = list(boards[game_idx].legal_moves)
+                legal_moves_per_game.append(legal)
+                ids = torch.tensor(
+                    [self.__tokenizer.encode_move(m) for m in legal],
                     dtype=torch.long,
                     device=self.__device,
-                )  # [n_active, 1]
+                )
+                legal_ids_per_game.append(ids)
+                legal_policy_per_game.append(policy_logits[local_idx][ids])
 
-                next_logits_list = []
-                for idx, game_idx in enumerate(active):
-                    token = latest_tokens[idx].unsqueeze(0)  # [1, 1]
-                    logits, _, new_cache = self.__model.generate_step(
-                        token,
-                        kv_caches[game_idx],
+            # -------------------------------------------------------- #
+            # Value scoring: one big generate_step (when λ > 0)        #
+            # repeat_interleave expands each game's cache row           #
+            # n_legal_i times, matching the flat legal-move token list  #
+            # -------------------------------------------------------- #
+            if value_weight > 0.0:
+                counts = [len(ids) for ids in legal_ids_per_game]
+                repeats = torch.tensor(counts, dtype=torch.long, device=self.__device)
+
+                flat_cache = KVCache(
+                    layers=[
+                        LayerKVCache(
+                            k=torch.repeat_interleave(layer.k, repeats, dim=0),
+                            v=torch.repeat_interleave(layer.v, repeats, dim=0),
+                        )
+                        for layer in joint_cache.layers
+                    ]
+                )
+                value_tokens = torch.cat(legal_ids_per_game).unsqueeze(1)  # [total_legal, 1]
+
+                with torch.no_grad():
+                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
+                        _, value_preds, _ = self.__model.generate_step(value_tokens, flat_cache)
+                value_flat = value_preds[:, 0]  # [total_legal]
+
+                offset = 0
+                final_scores_per_game: list[torch.Tensor] = []
+                for local_idx, game_idx in enumerate(active):
+                    n_legal = counts[local_idx]
+                    v = value_flat[offset : offset + n_legal]
+                    if boards[game_idx].turn == chess.BLACK:
+                        v = -v
+                    final_scores_per_game.append(
+                        legal_policy_per_game[local_idx] + value_weight * v
                     )
-                    next_logits_list.append(logits[0, 0])  # [vocab_size]
-                    kv_caches[game_idx] = new_cache
+                    offset += n_legal
+            else:
+                final_scores_per_game = legal_policy_per_game
 
-                still_active = []
-                for idx, game_idx in enumerate(active):
-                    board = boards[game_idx]
-                    legal_mask = self.__tokenizer.get_legal_mask(board).to(self.__device)
-                    masked_logits = next_logits_list[idx] + legal_mask
-                    probs = F.softmax(masked_logits, dim=-1)
+            # -------------------------------------------------------- #
+            # Sample, advance boards, collect completed games           #
+            # -------------------------------------------------------- #
+            sampled_tokens: list[int] = []
+            still_active: list[int] = []
+            keep_local: list[int] = []  # local indices to retain in joint cache
 
-                    if torch.isnan(probs).any() or torch.isinf(probs).any():
-                        legal_indices = (legal_mask == 0.0).nonzero(as_tuple=True)[0]
-                        token_id = legal_indices[torch.randint(len(legal_indices), (1,))].item()
-                    else:
-                        token_id = torch.multinomial(probs, num_samples=1).item()
+            for local_idx, game_idx in enumerate(active):
+                board = boards[game_idx]
+                legal = legal_moves_per_game[local_idx]
+                probs = F.softmax(final_scores_per_game[local_idx], dim=0)
 
-                    move = self.__tokenizer.decode_move(int(token_id))
-                    if move is None:
-                        raise RuntimeError(f"unexpected move: {move}")
+                if torch.isnan(probs).any() or torch.isinf(probs).any():
+                    move_idx = int(torch.randint(len(legal), (1,)).item())
+                else:
+                    move_idx = int(torch.multinomial(probs, num_samples=1).item())
 
-                    board.push(move)
-                    move_history[game_idx].append(int(token_id))
+                move = legal[move_idx]
+                board.push(move)
+                token = self.__tokenizer.encode_move(move)
+                move_history[game_idx].append(token)
 
-                    if board.is_game_over() or len(move_history[game_idx]) >= max_moves:
-                        game = self.__extract_game(boards[game_idx], move_history[game_idx])
-                        if game is not None:
-                            results.append(game)
-                        kv_caches[game_idx] = None  # type: ignore
-                    else:
-                        still_active.append(game_idx)
+                if board.is_game_over() or len(move_history[game_idx]) >= max_moves:
+                    game = self.__extract_game(boards[game_idx], move_history[game_idx])
+                    if game is not None:
+                        results.append(game)
+                else:
+                    still_active.append(game_idx)
+                    sampled_tokens.append(token)
+                    keep_local.append(local_idx)
 
-                active = still_active
+            active = still_active
+            if not active:
+                break
+
+            # -------------------------------------------------------- #
+            # Drop completed games from the joint cache                 #
+            # -------------------------------------------------------- #
+            if len(keep_local) < n_active:
+                joint_cache = KVCache(
+                    layers=[
+                        LayerKVCache(k=layer.k[keep_local], v=layer.v[keep_local])
+                        for layer in joint_cache.layers
+                    ]
+                )
+
+            # -------------------------------------------------------- #
+            # Advance joint cache with sampled moves → next policy      #
+            # -------------------------------------------------------- #
+            token_tensor = torch.tensor(
+                sampled_tokens, dtype=torch.long, device=self.__device
+            ).unsqueeze(
+                1
+            )  # [n_still_active, 1]
+
+            with torch.no_grad():
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
+                    logits, _, joint_cache = self.__model.generate_step(token_tensor, joint_cache)
+            policy_logits = logits[:, 0, :]  # [n_still_active, vocab_size]
 
         return results
 
     def __generation_round_fw_no_cache(self, n: int) -> list[dict[str, Any]]:
-        """Generate n self-play games using full forward recompute. Higher compute, lower VRAM."""
+        """Generate n self-play games using batched full forward recompute.
+
+        At each step all active games have identical sequence lengths, so they
+        are stacked into a single [n_active, seq_len] tensor for one batched
+        forward pass instead of n_active separate passes.
+
+        When value_weight > 0, the value sequences (history + each legal move)
+        are also all the same length, so all legal moves across all games are
+        concatenated into one further batched forward pass.
+        """
         boards = [chess.Board() for _ in range(n)]
         move_history = [[self.__tokenizer.BOS] for _ in range(n)]
         active = list(range(n))
-        max_moves = self.__config.max_moves
+        max_moves = self.__config.self_play_max_moves
+        value_weight = self.__selfplay_value_weight
         results: list[dict[str, Any]] = []
 
         while active:
-            still_active = []
-            for game_idx in active:
-                board = boards[game_idx]
-                move = sample_move(
-                    model=self.__model,
-                    tokenizer=self.__tokenizer,
-                    board=board,
-                    move_history=move_history[game_idx],
+            # -------------------------------------------------------- #
+            # Policy step: one forward pass for all active games        #
+            # -------------------------------------------------------- #
+            input_ids = torch.tensor(
+                [move_history[i] for i in active],
+                dtype=torch.long,
+                device=self.__device,
+            )  # [n_active, seq_len]
+
+            with torch.no_grad():
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
+                    logits, _ = self.__model(input_ids, is_causal=True)
+
+            policy_logits = logits[:, -1, :].clone()  # [n_active, vocab_size]
+            del logits, _
+
+            # -------------------------------------------------------- #
+            # Per-game: enumerate legal moves, slice policy scores      #
+            # -------------------------------------------------------- #
+            legal_moves_per_game: list[list[chess.Move]] = []
+            legal_ids_per_game: list[torch.Tensor] = []
+            legal_policy_per_game: list[torch.Tensor] = []
+
+            for idx, game_idx in enumerate(active):
+                legal = list(boards[game_idx].legal_moves)
+                legal_moves_per_game.append(legal)
+                ids = torch.tensor(
+                    [self.__tokenizer.encode_move(m) for m in legal],
+                    dtype=torch.long,
                     device=self.__device,
-                    value_weight=self.__selfplay_value_weight,
-                    bf16=self.__config.bf16,
                 )
+                legal_ids_per_game.append(ids)
+                legal_policy_per_game.append(policy_logits[idx][ids])
+
+            # -------------------------------------------------------- #
+            # Value step: one big batched forward pass (when λ > 0)    #
+            # All value sequences are length seq_len+1 — same length   #
+            # for every (game, legal_move) pair.                        #
+            # -------------------------------------------------------- #
+            if value_weight > 0.0:
+                value_seqs: list[list[int]] = []
+                counts: list[int] = []
+                for idx, game_idx in enumerate(active):
+                    hist = move_history[game_idx]
+                    for tid in legal_ids_per_game[idx]:
+                        value_seqs.append(hist + [int(tid.item())])
+                    counts.append(len(legal_ids_per_game[idx]))
+
+                value_input = torch.tensor(
+                    value_seqs, dtype=torch.long, device=self.__device
+                )  # [total_legal, seq_len+1]
+
+                with torch.no_grad():
+                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
+                        value_logits, value_preds = self.__model(value_input, is_causal=True)
+                del value_logits, value_input
+
+                value_flat = value_preds[:, -1].clone()  # [total_legal]
+                del value_preds
+
+                offset = 0
+                final_scores_per_game: list[torch.Tensor] = []
+                for idx, game_idx in enumerate(active):
+                    n_legal = counts[idx]
+                    v = value_flat[offset : offset + n_legal]
+                    if boards[game_idx].turn == chess.BLACK:
+                        v = -v
+                    final_scores_per_game.append(legal_policy_per_game[idx] + value_weight * v)
+                    offset += n_legal
+            else:
+                final_scores_per_game = legal_policy_per_game
+
+            # -------------------------------------------------------- #
+            # Sample and advance each game                              #
+            # -------------------------------------------------------- #
+            still_active = []
+            for idx, game_idx in enumerate(active):
+                board = boards[game_idx]
+                legal = legal_moves_per_game[idx]
+                probs = F.softmax(final_scores_per_game[idx], dim=0)
+
+                if torch.isnan(probs).any() or torch.isinf(probs).any():
+                    move_idx = int(torch.randint(len(legal), (1,)).item())
+                else:
+                    move_idx = int(torch.multinomial(probs, num_samples=1).item())
+
+                move = legal[move_idx]
                 board.push(move)
                 move_history[game_idx].append(self.__tokenizer.encode_move(move))
 
@@ -620,9 +804,213 @@ class ChessTrainer:
                     self.__add_batch_to_dataset(path)
                 self.__sp_eval_time_s += time.perf_counter() - t_eval
 
+            # keep memory under control
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
         finally:
             if evaluator is not None:
                 evaluator.close()
+
+    def __run_epoch_streaming(
+        self, epoch: int, n_bank: int, n_self_play: int, ratio: float
+    ) -> tuple[float, float, bool]:
+        """
+        Streaming training: generate games in self_play_batch_size chunks, accumulate
+        gradients across all chunks, then take a single optimizer.step() per epoch.
+        Never holds more than self_play_batch_size games in memory at one time.
+
+        Self-play games are evaluated synchronously per chunk (no async pipeline).
+        """
+        chunk_size = self.__config.streaming_chunk_size
+        train_bs = self.__config.train_batch_size
+
+        # Init per-epoch metrics
+        self.__eval_time_ms = 0.0
+        self.__eval_game_count = 0
+        self.__sp_gen_time_s = 0.0
+        self.__sp_eval_time_s = 0.0
+        self.__sp_games_generated = 0
+        self.__sp_games_included = 0
+
+        # Build list of (n_bank_this, n_sp_this) chunks
+        bank_left = n_bank
+        sp_left = n_self_play
+        chunks: list[tuple[int, int]] = []
+        while bank_left > 0 or sp_left > 0:
+            b = min(bank_left, chunk_size)
+            sp = min(sp_left, chunk_size - b)
+            chunks.append((b, sp))
+            bank_left -= b
+            sp_left -= sp
+
+        if not chunks:
+            return 0.0, 0.0, False
+
+        outcome_scale = (
+            min(1.0, epoch / max(self.__config.outcome_warmup, 1)) if ratio > 0.0 else 0.0
+        )
+
+        total_loss = 0.0
+        total_value_loss = 0.0
+        total_mini_batches = 0
+
+        self.__optimizer.zero_grad()
+
+        for b_this, sp_this in chunks: #tqdm(chunks, desc="chunks", leave=False):
+            self.__dataset.clear()
+
+            # ---------------------------------------------------------- #
+            # Generate games for this chunk (eval mode, no grad)         #
+            # ---------------------------------------------------------- #
+            self.__model.eval()
+
+            if b_this > 0:
+                self.__generate_from_bank(b_this)
+
+            if sp_this > 0:
+                t_gen = time.perf_counter()
+                print(f'self-playing {sp_this} games')
+                sp_batch = self.__generation_round(sp_this)
+                self.__sp_gen_time_s += time.perf_counter() - t_gen
+                self.__sp_games_generated += len(sp_batch)
+
+                t_eval = time.perf_counter()
+                for item in sp_batch:
+                    try:
+                        moves = [chess.Move.from_uci(uci) for uci in item["moves"]]
+                        tensor = self.__tokenizer.encode_game_tensor(moves)
+                        weights: torch.Tensor | None = None
+                        if self.__evaluator is not None:
+                            weights = compute_move_weights(
+                                moves,
+                                self.__evaluator,
+                                self.__selfplay_stockfish_depth,
+                                self.__config.advantage_temperature,
+                            )
+                        self.__dataset.add_game(
+                            GameRecord(
+                                moves=moves,
+                                outcome=float(item["outcome"]),
+                                tensor=tensor,
+                                move_weights=weights,
+                            )
+                        )
+                        self.__sp_games_included += 1
+                    except Exception:
+                        continue
+                self.__sp_eval_time_s += time.perf_counter() - t_eval
+
+                # keep memory under control
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
+            if len(self.__dataset) == 0:
+                continue
+
+            # ---------------------------------------------------------- #
+            # Train on this chunk (train mode, accumulate gradients)     #
+            # ---------------------------------------------------------- #
+            self.__model.train()
+
+            dataloader = DataLoader(
+                self.__dataset,
+                batch_size=min(train_bs, len(self.__dataset)),
+                shuffle=True,
+                collate_fn=self.__dataset.collate,
+            )
+
+            if outcome_scale > 0.0:
+                chunk_outcomes = torch.tensor(
+                    [g.outcome for g in self.__dataset.games], device=self.__device
+                )
+                outcome_weights = (chunk_outcomes * 2 - 1).mean()
+            else:
+                outcome_weights = torch.tensor(0.0, device=self.__device)
+
+            for batch in dataloader:
+                input_ids = cast(torch.Tensor, batch["input_ids"]).to(self.__device)
+                targets = cast(torch.Tensor, batch["targets"]).to(self.__device)
+                attention_mask = cast(torch.Tensor, batch["attention_mask"]).to(self.__device)
+                move_weights = cast(torch.Tensor, batch["move_weights"]).to(self.__device)
+                value_targets = cast(torch.Tensor, batch["value_evals"]).to(self.__device)
+                has_evals = cast(torch.Tensor, batch["has_value_evals"]).to(self.__device)
+
+                causal_mask = make_causal_mask(input_ids.size(1), self.__device)
+                padding_mask = make_padding_mask(attention_mask).to(self.__device)
+                combined_mask = causal_mask + padding_mask
+
+                assert (
+                    input_ids.max().item() < self.__tokenizer.vocab_size
+                ), f"token ID {input_ids.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
+                assert input_ids.min().item() >= 0, f"negative token ID {input_ids.min().item()}"
+                assert (
+                    targets.max().item() < self.__tokenizer.vocab_size
+                ), f"target token ID {targets.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
+
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
+                    logits, value_pred = self.__model(input_ids, combined_mask)
+
+                    per_token_loss = F.cross_entropy(
+                        logits.view(-1, self.__tokenizer.vocab_size),
+                        targets.view(-1),
+                        ignore_index=self.__tokenizer.PAD,
+                        label_smoothing=0.1,
+                        reduction="none",
+                    )
+
+                    pad_mask = (targets.view(-1) != self.__tokenizer.PAD).float()
+                    weights_flat = move_weights.view(-1)
+                    denom = pad_mask.sum().clamp(min=1)
+                    policy_loss = (per_token_loss * weights_flat * pad_mask).sum() / denom
+
+                    token_mask = attention_mask.bool() & has_evals.unsqueeze(1)
+                    if token_mask.any():
+                        value_loss_t = F.mse_loss(value_pred[token_mask], value_targets[token_mask])
+                        loss = policy_loss + self.__config.value_loss_weight * value_loss_t
+                    else:
+                        value_loss_t = torch.tensor(0.0, device=self.__device)
+                        loss = policy_loss
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print("warning: NaN/inf loss detected, skipping mini-batch")
+                    continue
+
+                scaled_loss = loss * (1.0 + outcome_scale * outcome_weights)
+                # Accumulate gradients without per-batch scaling;
+                # we normalize by total_mini_batches after all chunks complete
+                scaled_loss.backward()  # type: ignore[no-untyped-call]
+
+                total_loss += scaled_loss.item()
+                total_value_loss += value_loss_t.item()
+                total_mini_batches += 1
+
+        if total_mini_batches == 0:
+            print("warning: all mini-batches had NaN/inf loss, skipping update")
+            self.__optimizer.zero_grad()
+            return 0.0, 0.0, False
+
+        # Normalize: divide accumulated gradients so the effective update equals
+        # the mean loss over all mini-batches (same semantics as train_on_games)
+        for p in self.__model.parameters():
+            if p.grad is not None:
+                p.grad /= total_mini_batches
+
+        for name, p in self.__model.named_parameters():
+            if torch.isnan(p).any() or torch.isinf(p).any():
+                print(f"  bad weight: {name} nan={torch.isnan(p).any()} inf={torch.isinf(p).any()}")
+
+        if any(torch.isnan(p.grad).any() for p in self.__model.parameters() if p.grad is not None):
+            print("warning: NaN gradients detected, skipping update")
+            self.__optimizer.zero_grad()
+            return total_loss / total_mini_batches, total_value_loss / total_mini_batches, False
+
+        torch.nn.utils.clip_grad_norm_(self.__model.parameters(), max_norm=1.0)
+        self.__optimizer.step()
+        self.__optimizer.zero_grad()
+
+        self.__last_loss = total_loss / total_mini_batches
+        return self.__last_loss, total_value_loss / total_mini_batches, True
 
     #
     # Training phase
@@ -879,6 +1267,7 @@ class ChessTrainer:
 
         loss = 0.0
         value_loss = 0.0
+        self_play_ratio = 0.0
         breakthrough_detector = LossBreakthroughDetector()
         for epoch in tqdm(range(self.__start_epoch, end_epoch)):
             epoch_start = time.perf_counter()
@@ -886,9 +1275,18 @@ class ChessTrainer:
             cycle = 10
             attempt = 1
             while True:
-                self_play_ratio = self.generate_games(epoch)
-                loss, value_loss, stepped = self.train_on_games(epoch, self_play_ratio)
+                if self.__config.streaming:
+                    ratio = self._self_play_ratio(epoch)
+                    n_sp = int(self.__config.n_games * ratio)
+                    n_bank = self.__config.n_games - n_sp
+                    loss, value_loss, stepped = self.__run_epoch_streaming(
+                        epoch, n_bank, n_sp, ratio
+                    )
+                else:
+                    ratio = self.generate_games(epoch)
+                    loss, value_loss, stepped = self.train_on_games(epoch, ratio)
                 if stepped:
+                    self_play_ratio = ratio
                     attempt = 1
                     break
                 print(f"failed to step {attempt} / {cycle} , retrying")
@@ -910,8 +1308,6 @@ class ChessTrainer:
             is_scheduled = epoch > 0 and epoch % self.__config.checkpoint_every == 0
             is_breakthrough = breakthrough_detector.update(loss)
             if is_scheduled or is_breakthrough:
-                if is_breakthrough:
-                    print(f"  loss breakthrough at epoch {epoch} ({loss:.4f}) — saving checkpoint")
                 self.__save_checkpoint(epoch, loss)
 
             # keep memory under control

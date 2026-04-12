@@ -76,6 +76,7 @@ class MultiHeadAttention(nn.Module):
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
         kv_cache: LayerKVCache | None = None,
+        is_causal: bool = False,
     ) -> tuple[torch.Tensor, LayerKVCache]:
         batch_size, seq_len, _ = x.shape
 
@@ -99,13 +100,17 @@ class MultiHeadAttention(nn.Module):
         # store updated cache
         new_cache = LayerKVCache(k=K, v=V)
 
-        # Flash Attention — never materialises the [batch, heads, seq, seq] matrix
+        # Use is_causal=True for generation passes — activates the Flash Attention
+        # kernel which never materialises the [batch, heads, seq, seq] score matrix.
+        # Float additive masks (training, combined causal+padding) force a fallback
+        # to the math backend which is O(T²) in memory, so avoid them during inference.
         out = F.scaled_dot_product_attention(
             Q,
             K,
             V,
-            attn_mask=mask,
+            attn_mask=None if is_causal else mask,
             dropout_p=self.dropout.p if self.training else 0.0,
+            is_causal=is_causal,
         )
 
         # merge heads back — transpose → [batch, seq_len, n_heads, d_k]

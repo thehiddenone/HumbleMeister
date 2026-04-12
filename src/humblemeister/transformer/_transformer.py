@@ -41,8 +41,9 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
         kv_cache: LayerKVCache | None = None,
+        is_causal: bool = False,
     ) -> tuple[torch.Tensor, LayerKVCache]:
-        attn_out, new_cache = self.attention(self.norm1(x), mask, kv_cache)
+        attn_out, new_cache = self.attention(self.norm1(x), mask, kv_cache, is_causal)
         x = x + self.dropout(attn_out)
         x = x + self.dropout(self.feed_forward(self.norm2(x)))
         return x, new_cache

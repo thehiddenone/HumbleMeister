@@ -74,20 +74,25 @@ class ChessTransformer(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
+        is_causal: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Training path — full sequence, no cache.
+        """Full-sequence forward pass (training and no-cache generation).
+
+        Pass is_causal=True for generation (no padding mask) to enable the
+        Flash Attention kernel. Pass mask=combined_mask for training where
+        a padding mask is needed alongside causal masking.
 
         Returns:
             logits: [batch, seq, vocab_size]
             value:  [batch, seq]  — position evaluation in [-1, 1] from White's perspective
         """
-        if mask is None:
+        if not is_causal and mask is None:
             mask = make_causal_mask(x.size(1), x.device)
 
         out = self.__input_embedding(x)
 
         for block in self.__blocks:
-            out, _ = block(out, mask, kv_cache=None)  # discard cache during training
+            out, _ = block(out, mask, kv_cache=None, is_causal=is_causal)
 
         hidden = self.__norm(out)
         logits = self.output(hidden)  # [batch, seq, vocab_size]
