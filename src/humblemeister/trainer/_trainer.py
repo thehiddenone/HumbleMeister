@@ -19,7 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 from humblemeister.attention import make_causal_mask, make_padding_mask
-from humblemeister.config import ChessTrainingConfig
+from humblemeister.config import ChessTrainingConfig, SelfPlayLossMode
 from humblemeister.data import ChessDataset, ChessGameBank, ChessTokenizer, GameRecord
 from humblemeister.evaluation import StockfishEvaluator, compute_move_weights
 from humblemeister.transformer import ChessTransformer
@@ -32,8 +32,18 @@ def get_scheduler(
     optimizer: torch.optim.Optimizer,
     n_epochs: int,
     warmup_epochs: int,
+    start_epoch: int = 0,
 ) -> LambdaLR:
-    def lr_lambda(epoch: int) -> float:
+    """Cosine-annealing LR with linear warmup.
+
+    The cosine curve spans [warmup_epochs, n_epochs].  ``start_epoch``
+    offsets the internal step counter so that ``step=0`` corresponds to
+    ``epoch=start_epoch`` — this lets a resumed run pick up at the correct
+    position on the curve without replaying scheduler steps.
+    """
+
+    def lr_lambda(step: int) -> float:
+        epoch = start_epoch + step
         if epoch < warmup_epochs:
             return epoch / max(warmup_epochs, 1)
         progress = (epoch - warmup_epochs) / max(n_epochs - warmup_epochs, 1)
@@ -51,7 +61,6 @@ class ChessTrainer:
     __tokenizer: ChessTokenizer
     __dataset: ChessDataset
     __gamebank: ChessGameBank
-    __start_epoch: int
     __last_loss: float
     __disable_selfplay: bool
     __selfplay_min_override: float | None
@@ -64,12 +73,9 @@ class ChessTrainer:
     __sp_games_generated: int
     __sp_games_included: int
 
-    def __init__(
-        self, config: ChessTrainingConfig, game_bank: ChessGameBank, resume: bool = False
-    ) -> None:
+    def __init__(self, config: ChessTrainingConfig, game_bank: ChessGameBank) -> None:
         self.__config = config
         self.__device = torch.device(config.device)
-        self.__start_epoch = 0
         self.__last_loss = 0.0
         self.__disable_selfplay = False
         self.__selfplay_min_override: float | None = None
@@ -106,13 +112,6 @@ class ChessTrainer:
 
         self.__optimizer = AdamW(self.__model.parameters(), lr=config.lr, weight_decay=0.1)
         self.__scheduler = get_scheduler(self.__optimizer, config.n_epochs, config.warmup_epochs)
-
-        if resume:
-            self.__load_latest_checkpoint()
-        else:
-            if self.checkpoints_path.exists():
-                shutil.rmtree(self.checkpoints_path)
-            os.makedirs(self.checkpoints_path, exist_ok=True)
 
         log_path = Path(config.log_dir) / self.__config.model_name
         os.makedirs(log_path, exist_ok=True)
@@ -258,6 +257,53 @@ class ChessTrainer:
                 )
             )
 
+    def __policy_loss(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        move_weights: torch.Tensor,
+        is_self_play: torch.Tensor,
+        loss_mode: SelfPlayLossMode,
+    ) -> torch.Tensor:
+        """
+        Compute the policy loss, branching per sample based on loss_mode.
+
+        VALUE_ONLY:          self-play samples contribute zero policy loss;
+                             only the value head trains on them.
+        ADVANTAGE_WEIGHTED:  bank games use label_smoothing=0.1 (imitation);
+                             self-play games use label_smoothing=0.0 (clean
+                             policy gradient weighted by Stockfish advantages).
+        """
+        vocab = self.__tokenizer.vocab_size
+        pad = self.__tokenizer.PAD
+        seq = targets.size(1)
+
+        is_sp_flat = is_self_play.unsqueeze(1).expand(-1, seq).reshape(-1)  # [B*T]
+        logits_flat = logits.view(-1, vocab)
+        targets_flat = targets.view(-1)
+
+        if loss_mode == SelfPlayLossMode.VALUE_ONLY:
+            per_token = F.cross_entropy(
+                logits_flat, targets_flat,
+                ignore_index=pad, label_smoothing=0.1, reduction="none",
+            )
+            policy_mask = (~is_sp_flat).float()
+        else:  # ADVANTAGE_WEIGHTED
+            smooth = F.cross_entropy(
+                logits_flat, targets_flat,
+                ignore_index=pad, label_smoothing=0.1, reduction="none",
+            )
+            raw = F.cross_entropy(
+                logits_flat, targets_flat,
+                ignore_index=pad, label_smoothing=0.0, reduction="none",
+            )
+            per_token = torch.where(is_sp_flat, raw, smooth)
+            policy_mask = torch.ones(targets_flat.size(0), device=targets_flat.device)
+
+        pad_mask = (targets_flat != pad).float()
+        denom = pad_mask.sum().clamp(min=1)
+        return (per_token * move_weights.view(-1) * pad_mask * policy_mask).sum() / denom
+
     def __generate_self_play(self, n_self_play: int) -> None:
         """Generate n_self_play games via SelfPlay and add them to the dataset."""
         t_gen = time.perf_counter()
@@ -319,6 +365,7 @@ class ChessTrainer:
         total_mini_batches = 0
 
         self.__optimizer.zero_grad()
+        loss_mode = SelfPlayLossMode(self.__config.self_play_loss_mode)
 
         sp_pbar = (
             tqdm(total=n_self_play, desc="self-play", unit="game", leave=False)
@@ -379,6 +426,7 @@ class ChessTrainer:
                 move_weights = cast(torch.Tensor, batch["move_weights"]).to(self.__device)
                 value_targets = cast(torch.Tensor, batch["value_evals"]).to(self.__device)
                 has_evals = cast(torch.Tensor, batch["has_value_evals"]).to(self.__device)
+                is_self_play = cast(torch.Tensor, batch["is_self_play"]).to(self.__device)
 
                 causal_mask = make_causal_mask(input_ids.size(1), self.__device)
                 padding_mask = make_padding_mask(attention_mask).to(self.__device)
@@ -395,18 +443,9 @@ class ChessTrainer:
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
                     logits, value_pred = self.__model(input_ids, combined_mask)
 
-                    per_token_loss = F.cross_entropy(
-                        logits.view(-1, self.__tokenizer.vocab_size),
-                        targets.view(-1),
-                        ignore_index=self.__tokenizer.PAD,
-                        label_smoothing=0.1,
-                        reduction="none",
+                    policy_loss = self.__policy_loss(
+                        logits, targets, move_weights, is_self_play, loss_mode
                     )
-
-                    pad_mask = (targets.view(-1) != self.__tokenizer.PAD).float()
-                    weights_flat = move_weights.view(-1)
-                    denom = pad_mask.sum().clamp(min=1)
-                    policy_loss = (per_token_loss * weights_flat * pad_mask).sum() / denom
 
                     token_mask = attention_mask.bool() & has_evals.unsqueeze(1)
                     if token_mask.any():
@@ -495,11 +534,16 @@ class ChessTrainer:
         total_value_loss = 0.0
         nan_batches = 0
         self.__optimizer.zero_grad()
+        loss_mode = SelfPlayLossMode(self.__config.self_play_loss_mode)
 
         for batch in dataloader:
             input_ids = cast(torch.Tensor, batch["input_ids"]).to(self.__device)
             targets = cast(torch.Tensor, batch["targets"]).to(self.__device)
             attention_mask = cast(torch.Tensor, batch["attention_mask"]).to(self.__device)
+            move_weights = cast(torch.Tensor, batch["move_weights"]).to(self.__device)
+            value_targets = cast(torch.Tensor, batch["value_evals"]).to(self.__device)
+            has_evals = cast(torch.Tensor, batch["has_value_evals"]).to(self.__device)
+            is_self_play = cast(torch.Tensor, batch["is_self_play"]).to(self.__device)
 
             causal_mask = make_causal_mask(input_ids.size(1), self.__device)
             padding_mask = make_padding_mask(attention_mask).to(self.__device)
@@ -513,25 +557,12 @@ class ChessTrainer:
                 targets.max().item() < self.__tokenizer.vocab_size
             ), f"target token ID {targets.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
 
-            move_weights = cast(torch.Tensor, batch["move_weights"]).to(self.__device)
-            value_targets = cast(torch.Tensor, batch["value_evals"]).to(self.__device)
-            has_evals = cast(torch.Tensor, batch["has_value_evals"]).to(self.__device)
-
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
                 logits, value_pred = self.__model(input_ids, combined_mask)
 
-                per_token_loss = F.cross_entropy(
-                    logits.view(-1, self.__tokenizer.vocab_size),
-                    targets.view(-1),
-                    ignore_index=self.__tokenizer.PAD,
-                    label_smoothing=0.1,
-                    reduction="none",
-                )  # [batch * seq_len]
-
-                pad_mask = (targets.view(-1) != self.__tokenizer.PAD).float()
-                weights_flat = move_weights.view(-1)
-                denom = pad_mask.sum().clamp(min=1)
-                policy_loss = (per_token_loss * weights_flat * pad_mask).sum() / denom
+                policy_loss = self.__policy_loss(
+                    logits, targets, move_weights, is_self_play, loss_mode
+                )
 
                 # value loss — only on positions from games that have Stockfish evals
                 token_mask = attention_mask.bool() & has_evals.unsqueeze(1)
@@ -670,7 +701,7 @@ class ChessTrainer:
         for p in self.__model.parameters():
             p.requires_grad = True
 
-        self.__save_checkpoint(self.__start_epoch - 1, self.__last_loss)
+        self.__save_checkpoint(0, self.__last_loss)
         print("value head pretraining complete")
 
     #
@@ -686,15 +717,96 @@ class ChessTrainer:
         self_play_stockfish_depth: int | None = 5,
         self_play_value_weight: float | None = None,
     ) -> None:
+        """Start training from scratch (epoch 0).  Clears existing checkpoints."""
+        if self.checkpoints_path.exists():
+            shutil.rmtree(self.checkpoints_path)
+        os.makedirs(self.checkpoints_path, exist_ok=True)
+
+        end_epoch = max_epochs or self.__config.n_epochs
+        self.__scheduler = get_scheduler(
+            self.__optimizer, end_epoch, self.__config.warmup_epochs,
+        )
+        self.__train_loop(
+            start_epoch=0,
+            end_epoch=end_epoch,
+            disable_selfplay=disable_selfplay,
+            self_play_min=self_play_min,
+            self_play_max=self_play_max,
+            self_play_stockfish_depth=self_play_stockfish_depth,
+            self_play_value_weight=self_play_value_weight,
+        )
+
+    def resume(
+        self,
+        start_epoch: int | None = None,
+        end_epoch: int | None = None,
+        max_epochs: int | None = None,
+        disable_selfplay: bool = False,
+        self_play_min: float | None = None,
+        self_play_max: float | None = None,
+        self_play_stockfish_depth: int | None = 5,
+        self_play_value_weight: float | None = None,
+    ) -> None:
+        """Resume training from the latest checkpoint.
+
+        The scheduler is rebuilt from scratch so that the LR curve is
+        consistent with the given ``start_epoch`` / ``end_epoch``.
+
+        Args:
+            start_epoch:  Override the starting epoch (default: checkpoint epoch + 1).
+            end_epoch:    Override the target end epoch (default: from checkpoint).
+            max_epochs:   Run for this many epochs from start_epoch (alternative to
+                          ``end_epoch``; ignored when ``end_epoch`` is set).
+            disable_selfplay / self_play_*:  same semantics as ``run()``.
+        """
+        checkpoint = self.__load_latest_checkpoint()
+        if checkpoint is None:
+            raise RuntimeError("no checkpoint found — use run() to start fresh")
+
+        cp_epoch: int = checkpoint["epoch"]
+        cp_end: int = checkpoint.get("end_epoch", self.__config.n_epochs)
+
+        current = start_epoch if start_epoch is not None else cp_epoch + 1
+        if end_epoch is not None:
+            target_end = end_epoch
+        elif max_epochs is not None:
+            target_end = current + max_epochs
+        else:
+            target_end = cp_end
+
+        if current >= target_end:
+            print(f"nothing to do: start_epoch={current} >= end_epoch={target_end}")
+            return
+
+        os.makedirs(self.checkpoints_path, exist_ok=True)
+        self.__scheduler = get_scheduler(
+            self.__optimizer, target_end, self.__config.warmup_epochs,
+            start_epoch=current,
+        )
+        print(f"LR curve: epoch {current} → {target_end} "
+              f"(warmup {self.__config.warmup_epochs})")
+        self.__train_loop(
+            start_epoch=current,
+            end_epoch=target_end,
+            disable_selfplay=disable_selfplay,
+            self_play_min=self_play_min,
+            self_play_max=self_play_max,
+            self_play_stockfish_depth=self_play_stockfish_depth,
+            self_play_value_weight=self_play_value_weight,
+        )
+
+    def __train_loop(
+        self,
+        start_epoch: int,
+        end_epoch: int,
+        disable_selfplay: bool,
+        self_play_min: float | None,
+        self_play_max: float | None,
+        self_play_stockfish_depth: int | None,
+        self_play_value_weight: float | None,
+    ) -> None:
         print(f"training on {self.__config.device}")
         print(f"model parameters: {sum(p.numel() for p in self.__model.parameters()):,}")
-
-        end_epoch = self.__start_epoch + max_epochs if max_epochs else self.__config.n_epochs
-        if end_epoch > self.__config.n_epochs:
-            self.__config.n_epochs = end_epoch
-            self.__scheduler = get_scheduler(
-                self.__optimizer, end_epoch, self.__config.warmup_epochs
-            )
 
         self.__disable_selfplay = disable_selfplay
         self.__selfplay_min_override = self_play_min
@@ -703,14 +815,14 @@ class ChessTrainer:
             self.__self_play._stockfish_depth = self_play_stockfish_depth
         if self_play_value_weight is not None:
             self.__self_play._value_weight = self_play_value_weight
-        self.__run_start_epoch = self.__start_epoch
+        self.__run_start_epoch = start_epoch
         self.__run_end_epoch = end_epoch
 
         loss = 0.0
         value_loss = 0.0
         self_play_ratio = 0.0
         breakthrough_detector = LossBreakthroughDetector()
-        for epoch in tqdm(range(self.__start_epoch, end_epoch)):
+        for epoch in tqdm(range(start_epoch, end_epoch)):
             epoch_start = time.perf_counter()
 
             cycle = 10
@@ -732,7 +844,7 @@ class ChessTrainer:
                     break
                 print(f"failed to step {attempt} / {cycle} , retrying")
                 if attempt % cycle == 0:
-                    print("bullshit warning, reinitializing weights")
+                    print("reinitializing weights")
                     self.__model.init_weights()
                     attempt = 1
                 else:
@@ -755,7 +867,6 @@ class ChessTrainer:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-        self.__start_epoch = end_epoch
         self.__save_checkpoint(end_epoch - 1, loss)
         self.writer.close()
         if self.__evaluator is not None:
@@ -813,9 +924,9 @@ class ChessTrainer:
         torch.save(
             {
                 "epoch": epoch,
+                "end_epoch": self.__run_end_epoch,
                 "model_state": self.__model.state_dict(),
                 "optimizer_state": self.__optimizer.state_dict(),
-                "scheduler_state": self.__scheduler.state_dict(),
                 "loss": loss,
             },
             path,
@@ -827,11 +938,15 @@ class ChessTrainer:
         for old in checkpoints[: -self.__config.keep_last_n]:
             old.unlink()
 
-    def __load_latest_checkpoint(self) -> None:
+    def __load_latest_checkpoint(self) -> dict | None:
+        """Load the latest checkpoint, restoring model and optimizer state.
+
+        Returns the raw checkpoint dict (with keys ``epoch``, ``end_epoch``,
+        ``loss``, etc.) or ``None`` if no checkpoints exist.
+        """
         checkpoints = sorted(self.checkpoints_path.glob("checkpoint_epoch_*.pt"))
         if not checkpoints:
-            print("no checkpoints found, starting from scratch")
-            return
+            return None
 
         path = checkpoints[-1]
         checkpoint = torch.load(path, map_location=self.__device, weights_only=True)
@@ -845,13 +960,12 @@ class ChessTrainer:
             self.__optimizer.load_state_dict(checkpoint["optimizer_state"])
         except ValueError:
             print("  optimizer state incompatible (model changed), starting optimizer fresh")
-        self.__scheduler.load_state_dict(checkpoint["scheduler_state"])
-        self.__start_epoch = checkpoint["epoch"] + 1
         self.__last_loss = float(checkpoint["loss"])
 
         print(
             f"resumed from {path.name} (epoch {checkpoint['epoch']}, loss {checkpoint['loss']:.4f})"
         )
+        return checkpoint
 
     def _check_tensors(self, label: str, **tensors: torch.Tensor) -> bool:
         """Returns True if any tensor contains NaN or inf."""

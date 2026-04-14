@@ -1,3 +1,3 @@
-from ._config import ChessTrainingConfig
+from ._config import ChessTrainingConfig, SelfPlayLossMode
 
-__all__ = ["ChessTrainingConfig"]
+__all__ = ["ChessTrainingConfig", "SelfPlayLossMode"]

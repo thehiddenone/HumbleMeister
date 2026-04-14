@@ -9,7 +9,7 @@ from humblemeister import ChessEngine
 
 # Add HF repos here
 MODEL_REGISTRY: dict[str, str] = {
-    "preview_04072026_2000_b3": "StanStanStan3141592/hmeister_giant_04072026_2000_b3",
+    "688M params, no self-play": "StanStanStan3141592/hmeister_giant_04072026_2000_b3",
 }
 
 _engines: dict[str, ChessEngine] = {}

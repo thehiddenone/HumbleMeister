@@ -1,4 +1,5 @@
 --extra-index-url https://download.pytorch.org/whl/cu130
+-e .
 absl-py==2.4.0
 aiofiles==24.1.0
 annotated-doc==0.0.4
@@ -50,7 +51,6 @@ hf-xet==1.4.3
 httpcore==1.0.9
 httpx==0.28.1
 huggingface_hub==1.10.1
--e .
 hyperlink==21.0.0
 idna==3.11
 inflate64==1.0.4

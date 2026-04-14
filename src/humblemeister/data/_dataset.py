@@ -19,9 +19,10 @@ class GameRecord:
     value_evals: torch.Tensor | None = (
         None  # [n_moves + 1], aligned with input_ids; tanh-normalized White's perspective
     )
+    is_self_play: bool = False
 
 
-class ChessDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
+class ChessDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]]):
     __tokenizer: ChessTokenizer
     __games: list[GameRecord]
 
@@ -42,7 +43,7 @@ class ChessDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
     def __len__(self) -> int:
         return len(self.__games)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
         record = self.__games[idx]
         if record.tensor is None:
             raise TypeError(f"unexpected None at index {idx}")
@@ -59,15 +60,16 @@ class ChessDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
             if record.value_evals is not None
             else torch.zeros(n_targets, dtype=torch.float32)
         )
-        return record.tensor, weights, value_evals
+        return record.tensor, weights, value_evals, record.is_self_play
 
     def collate(
-        self, batch: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+        self, batch: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]]
     ) -> dict[str, torch.Tensor]:
-        # batch is a list of (game_tensor, move_weights, value_evals) triples from __getitem__.
+        # batch is a list of (game_tensor, move_weights, value_evals, is_self_play) from __getitem__.
         tensors: list[torch.Tensor] = [item[0] for item in batch]
         weights: list[torch.Tensor] = [item[1] for item in batch]
         val_evals: list[torch.Tensor] = [item[2] for item in batch]
+        is_self_play_flags: list[bool] = [item[3] for item in batch]
 
         # pad all game tensors to the same length — shorter sequences get PAD appended
         padded = pad_sequence(tensors, batch_first=True, padding_value=self.__tokenizer.PAD)
@@ -108,4 +110,5 @@ class ChessDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
             "move_weights": move_weights,
             "value_evals": value_evals,
             "has_value_evals": has_value_evals,
+            "is_self_play": torch.tensor(is_self_play_flags, dtype=torch.bool),
         }

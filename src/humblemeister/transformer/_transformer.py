@@ -43,7 +43,12 @@ class TransformerBlock(nn.Module):
         kv_cache: LayerKVCache | None = None,
         is_causal: bool = False,
     ) -> tuple[torch.Tensor, LayerKVCache]:
+        # compute W_o [batch, seq_len, d_model]
         attn_out, new_cache = self.attention(self.norm1(x), mask, kv_cache, is_causal)
+
+        # residual connections
+        # input and W_o
         x = x + self.dropout(attn_out)
+        # the result after the 1st residual connection and FFN
         x = x + self.dropout(self.feed_forward(self.norm2(x)))
         return x, new_cache

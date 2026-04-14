@@ -58,11 +58,6 @@ class ChessTransformer(nn.Module):
     def output(self) -> nn.Linear:
         return self.__output
 
-    # def __init_weights(self) -> None:
-    #     for p in self.parameters():
-    #         if p.dim() > 1:
-    #             nn.init.xavier_uniform_(p)
-
     def init_weights(self) -> None:
         for name, p in self.named_parameters():
             if p.dim() > 1:

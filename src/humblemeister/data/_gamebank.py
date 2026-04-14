@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import multiprocessing
 import os
 import random
 import select
@@ -16,8 +17,10 @@ import chess
 import chess.engine
 import chess.pgn
 import py7zr
+import time
 import torch
 import torch.nn.functional as F
+import traceback
 
 # ipywidgets is optional — only available inside a Jupyter environment.
 # Import once at module load; assign None fallbacks so every reference is
@@ -215,6 +218,240 @@ def _fill_value_evals_group(
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 
+def _elo_passes(acc: list[str], elo_filter: int) -> bool:
+    """
+    Fast ELO check on raw PGN lines — no chess.pgn parsing needed.
+    Scans only until both tags are found, then stops.
+    Returns False if either tag is missing or below the threshold.
+    """
+    white_elo = black_elo = None
+    for line in acc:
+        if line.startswith('[WhiteElo "'):
+            try:
+                white_elo = int(line[11 : line.index('"', 11)])
+            except (ValueError, IndexError):
+                return False
+        elif line.startswith('[BlackElo "'):
+            try:
+                black_elo = int(line[11 : line.index('"', 11)])
+            except (ValueError, IndexError):
+                return False
+        if white_elo is not None and black_elo is not None:
+            break
+    if white_elo is None or black_elo is None:
+        return False
+    return white_elo >= elo_filter and black_elo >= elo_filter
+
+
+def _read_chess_file(args: tuple[str, int | None, io.TextIOWrapper | None]) -> list[dict[str, Any]]:
+    """
+    Module-level worker function — one call per archive file.
+
+    Extracts the archive, iterates lines, applies the ELO pre-filter on raw
+    text (no PGN parsing for rejected games), then calls chess.pgn.read_game
+    only for games that pass.  Returns a list of dicts with keys 'moves'
+    (list of UCI strings) and 'outcome' (float).
+    """
+    file_path, elo_filter, log = args
+
+    if log is not None:
+        log.write(f'_read_chess_file {file_path}\n')
+
+    content = []
+    if file_path.endswith(".7z"):
+        with py7zr.SevenZipFile(file_path, "r") as zf:
+            names = zf.namelist()
+            if len(names) != 1:
+                return []
+            with tempfile.TemporaryDirectory() as tmp:
+                zf.extractall(path=tmp)
+                with open(os.path.join(tmp, names[0]), "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read().splitlines()
+    elif file_path.endswith(".zip"):
+        with zipfile.ZipFile(file_path, "r") as zf:
+            names = zf.namelist()
+            if len(names) != 1:
+                return []
+            with zf.open(names[0]) as f:
+                content = f.read().decode("utf-8", errors="ignore").splitlines()
+    elif file_path.endswith(".pgn"):
+        with open(file_path, "rt") as f:
+            content = f.read().splitlines()
+
+    results: list[dict[str, Any]] = []
+    acc: list[str] = []
+
+    def _flush(acc: list[str]) -> None:
+        if not acc:
+            return
+        if elo_filter is not None and not _elo_passes(acc, elo_filter):
+            return
+        try:
+            game = chess.pgn.read_game(io.StringIO("\n".join(acc)), Visitor=_SilentGameBuilder)
+            if game is None:
+                return
+            result_str = game.headers.get("Result", "*")
+            outcome = {"1-0": 1.0, "0-1": 0.0, "1/2-1/2": 0.5}.get(result_str, 0.5)
+            moves = list(game.mainline_moves())
+            if moves:
+                results.append({"moves": [m.uci() for m in moves], "outcome": outcome})
+        except Exception:
+            pass
+
+    if log is not None:
+        log.write(f'len(content) = {len(content)}\n')
+
+    for line in content:
+        if line.startswith('[Event "'):
+            _flush(acc)
+            acc = []
+        acc.append(line)
+    _flush(acc)
+
+    if log is not None:
+        log.write(f'len(results) = {len(results)}\n')
+
+    return results
+
+
+def _convert_file(
+    args: tuple[str, int | None, str, str, int, float],
+) -> tuple[str, int, int]:
+    """Worker: read one PGN/7z/zip file, evaluate every game with Stockfish,
+    and write shards directly to *out_dir*.
+
+    Shard filenames are derived from the input file's stem so that
+    concurrent workers never collide: ``{stem}_{shard:04d}.pt``.
+
+    Returns ``(stem, n_games, n_shards_written)``.
+    """
+    file_path, elo_filter, out_dir, stockfish_path, depth, temperature = args
+
+    with open(file_path + '.log', 'wt', buffering=1) as log:
+
+        log.write(f'starting conversion of {file_path}\n')
+
+        # derive a unique stem from the input filename (strip all archive extensions)
+        stem = Path(file_path).name
+        for ext in (".7z", ".zip", ".pgn"):
+            if stem.endswith(ext):
+                stem = stem[: -len(ext)]
+                break
+
+        # check if the file was converted already
+        if os.path.isfile(os.path.join(out_dir, f"{stem}_0000.pt")):
+            idx = 0
+            n_shards = 0
+            len_games = 0
+            pt_path = os.path.join(out_dir, f"{stem}_{idx:04d}.pt")
+            while os.path.isfile(pt_path):
+                shard: list[dict[str, Any]] = torch.load(pt_path, weights_only=False)
+                n_shards += 1
+                len_games += len(shard)
+                idx += 1
+                pt_path = os.path.join(out_dir, f"{stem}_{idx:04d}.pt")
+            log.write(f'alrady converted {file_path}: {stem}, {len_games}, {n_shards}\n')
+            return (stem, len_games, n_shards)
+
+        games = _read_chess_file((file_path, elo_filter, log))
+        if not games:
+            log.write(f'failure: no games\n')
+            return (stem, 0, 0)
+
+        log.write(f'read {len(games)} games\n')
+
+        try:
+            engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+        except Exception:
+            log.write(f'failure: failed to init stockfish\n')
+            return (stem, 0, 0)
+
+        t0 = time.time()
+        conversion_time = 0.0
+        eval_time = 0.0
+        weighting_time = 0.0
+        if engine is not None:
+            try:
+                for game_idx, item in enumerate(games):
+                    moves_uci: list[str] = item["moves"]
+                    n_moves = len(moves_uci)
+                    try:
+                        t_c = time.time()
+                        moves = [chess.Move.from_uci(u) for u in moves_uci]
+                        board = chess.Board()
+                        boards: list[chess.Board] = [board.copy()]
+                        for move in moves:
+                            board.push(move)
+                            boards.append(board.copy())
+                        conversion_time += time.time() - t_c
+
+                        t_e = time.time()
+                        evals: list[float] = []
+                        for b in boards:
+                            info = engine.analyse(b, chess.engine.Limit(depth=depth))
+                            pov = info.get("score")
+                            if pov is None:
+                                evals.append(0.0)
+                                continue
+                            rel = pov.relative
+                            if rel.is_mate():
+                                mate = rel.mate()
+                                assert mate is not None
+                                evals.append(float(_MATE_CAP_CP if mate > 0 else -_MATE_CAP_CP))
+                            else:
+                                cp = rel.score()
+                                evals.append(float(cp) if cp is not None else 0.0)
+                        eval_time += time.time() - t_e
+
+                        t_w = time.time()
+                        # advantage weights
+                        if n_moves < 2:
+                            item["weights"] = torch.ones(n_moves + 1)
+                        else:
+                            advs = torch.tensor(
+                                [-evals[t] - evals[t - 1] for t in range(1, n_moves + 1)],
+                                dtype=torch.float32,
+                            )
+                            std = advs.std(correction=0)
+                            if std > 0:
+                                advs = (advs - advs.mean()) / (std + 1e-8)
+                            weights = F.softmax(advs / temperature, dim=0) * n_moves
+                            item["weights"] = torch.cat([weights, torch.ones(1)], dim=0)
+
+                        # value evals (tanh-normalised, White's perspective)
+                        white_pov = [e if i % 2 == 0 else -e for i, e in enumerate(evals)]
+                        item["value_evals"] = torch.tensor(
+                            [math.tanh(v / 400.0) for v in white_pov],
+                            dtype=torch.float32,
+                        )
+                        weighting_time += time.time() - t_w
+                    except Exception:
+                        log.write(f'exception was raised: {traceback.format_exc()}\n')
+                        item["weights"] = torch.ones(n_moves + 1)
+                        item["value_evals"] = None
+
+                    game_count = game_idx + 1
+                    if game_idx > 0 and game_count % 10 == 0:
+                        dt = time.time() - t0
+                        log.write(f'converted {game_idx + 1} games so far, elapsed time {dt}, {dt / game_count} per game\n')
+                        log.write(f'conversion_time = {conversion_time} {conversion_time/game_count}\n')
+                        log.write(f'eval_time = {eval_time} {eval_time/game_count}\n')
+                        log.write(f'weighting_time = {weighting_time} {weighting_time/game_count}\n')
+                        log.write('---\n')
+            finally:
+                engine.quit()
+                log.write('closing the engine')
+
+        # write shards to disk immediately — no data sent back to parent
+        n_shards = 0
+        for start in range(0, len(games), _SHARD_SIZE):
+            shard = games[start : start + _SHARD_SIZE]
+            torch.save(shard, os.path.join(out_dir, f"{stem}_{n_shards:04d}.pt"))
+            n_shards += 1
+
+    return (stem, len(games), n_shards)
+
+
 class _SilentGameBuilder(chess.pgn.GameBuilder[chess.pgn.Game]):
     """GameBuilder that silently ignores parse errors such as result tokens
     ('1-0', '0-1', '1/2-1/2') appearing inside the move list."""
@@ -245,75 +482,28 @@ class ChessGameBank:
     #  PGN loading                                                         #
     # ------------------------------------------------------------------ #
 
-    def __read_pgn_archive(self, file_path: str) -> list[chess.pgn.Game]:
-        if file_path.endswith(".7z"):
-            with py7zr.SevenZipFile(file_path, "r") as zf:
-                names = zf.namelist()
-                if len(names) != 1:
-                    raise ValueError(f"Expected exactly 1 file in 7z, found {len(names)}: {names}")
-                with tempfile.TemporaryDirectory() as tmp:
-                    zf.extractall(path=tmp)
-                    extracted = os.path.join(tmp, names[0])
-                    with open(extracted, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read().splitlines()
-        else:
-            with zipfile.ZipFile(file_path, "r") as zf:
-                names = zf.namelist()
-                if len(names) != 1:
-                    raise ValueError(f"Expected exactly 1 file in ZIP, found {len(names)}: {names}")
-                with zf.open(names[0]) as f:
-                    content = f.read().decode("utf-8", errors="ignore").splitlines()
+    def load_games(self, dir_path: str, n_workers: int = 8) -> None:
+        """
+        Load games from all PGN zip and 7z archives found under dir_path.
 
-        total_lines = len(content)
-        bar = (
-            widgets.IntProgress(min=0, max=max(total_lines, 1), description="Parsing:")
-            if widgets is not None
-            else None
-        )
-        status = (
-            widgets.HTML(value=f"<small>0 / {total_lines:,} lines</small>")
-            if widgets is not None
-            else None
-        )
-        if bar is not None and status is not None:
-            _display(widgets.HBox([bar, status]))  # type: ignore[no-untyped-call]
-
-        result: list[chess.pgn.Game] = []
-        acc: list[str] = []
-        for n, line in enumerate(content, start=1):
-            if line.startswith('[Event "'):
-                if acc:
-                    game = chess.pgn.read_game(
-                        io.StringIO("\n".join(acc)), Visitor=_SilentGameBuilder
-                    )
-                    if game:
-                        result.append(game)
-                    acc = []
-            acc.append(line)
-            if bar is not None and status is not None and n % 10 == 0:
-                bar.value = n
-                status.value = (
-                    f"<small>{n:,} / {total_lines:,} lines &mdash; {len(result):,} games</small>"
-                )
-
-        if bar is not None and status is not None:
-            bar.bar_style = "success"
-            status.value = f"<small>{total_lines:,} lines &mdash; {len(result):,} games</small>"
-
-        return result
-
-    def load_games(self, dir_path: str) -> None:
-        """Load games from all PGN zip and 7z archives found under dir_path."""
+        Spawns up to n_workers processes (one per file) so multiple archives are
+        parsed in parallel.  Within each worker, the ELO filter is applied on raw
+        PGN text before chess.pgn.read_game is called, skipping rejected games
+        entirely.  Progress updates as each file completes.
+        """
         archive_files = [
             os.path.join(root, file)
             for root, _, files in os.walk(dir_path)
             for file in files
-            if file.endswith(".zip") or file.endswith(".7z")
+            if file.endswith(".zip") or file.endswith(".7z") or file.endswith(".pgn")
         ]
 
         total_files = len(archive_files)
+        if total_files == 0:
+            return
+
         bar = (
-            widgets.IntProgress(min=0, max=max(total_files, 1), description="Loading:")
+            widgets.IntProgress(min=0, max=total_files, description="Loading:")
             if widgets is not None
             else None
         )
@@ -321,36 +511,149 @@ class ChessGameBank:
         if bar is not None and status is not None:
             _display(widgets.HBox([bar, status]))  # type: ignore[no-untyped-call]
 
-        for n, path in enumerate(archive_files, start=1):
-            if bar is not None and status is not None:
-                bar.value = n
-                status.value = f"<small>[{n}/{total_files}] {os.path.basename(path)}</small>"
-            for game in self.__read_pgn_archive(path):
-                if self.__elo_filter is not None:
-                    try:
-                        white_elo = int(game.headers.get("WhiteElo", ""))
-                        black_elo = int(game.headers.get("BlackElo", ""))
-                    except (ValueError, TypeError):
-                        continue
-                    if white_elo < self.__elo_filter or black_elo < self.__elo_filter:
-                        continue
+        args = [(path, self.__elo_filter, None) for path in archive_files]
+        n_procs = min(n_workers, total_files)
+        files_done = 0
 
-                result = game.headers.get("Result", "*")
-                outcome = {"1-0": 1.0, "0-1": 0.0, "1/2-1/2": 0.5}.get(result, 0.5)
-                self.__records.append(
-                    _BankRecord(
-                        moves=list(game.mainline_moves()),
-                        outcome=outcome,
-                        move_weights=None,
-                        value_evals=None,
+        ctx = multiprocessing.get_context("fork")
+        with ctx.Pool(processes=n_procs) as pool:
+            for game_dicts in pool.imap_unordered(_read_chess_file, args):
+                for gd in game_dicts:
+                    self.__records.append(
+                        _BankRecord(
+                            moves=[chess.Move.from_uci(uci) for uci in gd["moves"]],
+                            outcome=gd["outcome"],
+                            move_weights=None,
+                            value_evals=None,
+                        )
                     )
-                )
+                files_done += 1
+                if bar is not None and status is not None:
+                    bar.value = files_done
+                    status.value = (
+                        f"<small>[{files_done}/{total_files}] "
+                        f"{len(self.__records):,} games</small>"
+                    )
 
         if bar is not None and status is not None:
             bar.bar_style = "success"
-            status.value = f"<small>loaded &mdash; {len(self.__records):,} games</small>"
+            status.value = f"<small>done &mdash; {len(self.__records):,} games</small>"
 
         random.shuffle(self.__records)
+
+    # ------------------------------------------------------------------ #
+    #  PGN → evaluated .pt conversion                                      #
+    # ------------------------------------------------------------------ #
+
+    def convert_games(
+        self,
+        source_path: str,
+        output_path: str,
+        n_workers: int = 8,
+        stockfish_path: str = "stockfish",
+        depth: int = 5,
+        temperature: float = 1.0,
+    ) -> None:
+        """Read PGN files from *source_path*, evaluate every game with
+        Stockfish, and write the results as .pt shards to *output_path*
+        (compatible with :meth:`load`).
+
+        Each worker processes one file end-to-end: reads the PGN, replays
+        every game, evaluates positions with its own Stockfish instance,
+        computes advantage weights + value evals, and writes shards
+        directly to *output_path*.  The parent never holds game data —
+        only lightweight ``(stem, n_games, n_shards)`` results come back
+        through the pool.
+
+        After all workers finish the parent renames the per-file shard
+        files to sequential ``shard_XXXX.pt`` and writes ``meta.json``.
+
+        Args:
+            source_path:    directory containing .pgn / .zip / .7z files.
+            output_path:    directory where shard .pt files will be written.
+            n_workers:      max number of parallel worker processes.
+            stockfish_path: path to the Stockfish binary.
+            depth:          Stockfish search depth.
+            temperature:    advantage-weight softmax temperature.
+        """
+        archive_files = [
+            os.path.join(root, file)
+            for root, _, files in os.walk(source_path)
+            for file in files
+            if file.endswith(".zip") or file.endswith(".7z") or file.endswith(".pgn")
+        ]
+        total_files = len(archive_files)
+        if total_files == 0:
+            print("no PGN files found")
+            return
+
+        p = Path(output_path)
+        p.mkdir(parents=True, exist_ok=True)
+
+        args = [
+            (path, self.__elo_filter, str(p), stockfish_path, depth, temperature)
+            for path in archive_files
+        ]
+        n_procs = min(n_workers, total_files)
+
+        bar = (
+            widgets.IntProgress(min=0, max=total_files, description="Converting:")
+            if widgets is not None
+            else None
+        )
+        status = widgets.HTML(value="") if widgets is not None else None
+        if bar is not None and status is not None:
+            _display(widgets.HBox([bar, status]))  # type: ignore[no-untyped-call]
+
+        total_games = 0
+        total_shards = 0
+        files_done = 0
+
+        ctx = multiprocessing.get_context("fork")
+        with ctx.Pool(processes=n_procs) as pool:
+            for _stem, n_games, n_shards in pool.imap_unordered(_convert_file, args):
+                total_games += n_games
+                total_shards += n_shards
+                files_done += 1
+                if bar is not None and status is not None:
+                    bar.value = files_done
+                    status.value = (
+                        f"<small>[{files_done}/{total_files}] "
+                        f"{total_games:,} games, {total_shards} shards</small>"
+                    )
+
+        if total_shards == 0:
+            print("no games converted")
+            return
+
+        # rename per-file shards to sequential shard_XXXX.pt
+        tmp_shards = sorted(
+            sp for sp in p.iterdir()
+            if sp.suffix == ".pt" and sp.name != "meta.json"
+        )
+        for i, old in enumerate(tmp_shards):
+            old.rename(p / f"shard_{i:04d}.pt")
+
+        with open(p / "meta.json", "w") as f:
+            json.dump(
+                {
+                    "n_games": total_games,
+                    "n_shards": len(tmp_shards),
+                    "shard_size": _SHARD_SIZE,
+                },
+                f,
+            )
+
+        if bar is not None and status is not None:
+            bar.bar_style = "success"
+            status.value = (
+                f"<small>done &mdash; {total_games:,} games → "
+                f"{len(tmp_shards)} shards in {p}/</small>"
+            )
+
+        print(
+            f"converted {total_games:,} games to {len(tmp_shards)} shards in {p}/"
+        )
 
     # ------------------------------------------------------------------ #
     #  Stockfish evaluation                                                #
@@ -581,13 +884,16 @@ class ChessGameBank:
     #  Persistence                                                         #
     # ------------------------------------------------------------------ #
 
-    def save(self, path: str) -> None:
+    def save(self, path: str, shard_size: int | None = None) -> None:
         """Save the bank to a directory of shard files."""
         p = Path(path)
         p.mkdir(parents=True, exist_ok=True)
 
+        if shard_size is None:
+            shard_size = _SHARD_SIZE
+
         shards = [
-            self.__records[i : i + _SHARD_SIZE] for i in range(0, len(self.__records), _SHARD_SIZE)
+            self.__records[i : i + shard_size] for i in range(0, len(self.__records), shard_size)
         ]
 
         with open(p / "meta.json", "w") as f:
@@ -595,7 +901,7 @@ class ChessGameBank:
                 {
                     "n_games": len(self.__records),
                     "n_shards": len(shards),
-                    "shard_size": _SHARD_SIZE,
+                    "shard_size": shard_size,
                 },
                 f,
             )

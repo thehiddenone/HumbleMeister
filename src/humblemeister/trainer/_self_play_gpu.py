@@ -215,7 +215,7 @@ class SelfPlayGPU:
     def generate(
         self,
         model: ChessTransformer,
-        model_config: ChessTrainingConfig,
+        model_config: ChessTrainingConfig,  # noqa: ARG002 — interface parity with SelfPlayCPU
         tokenizer: ChessTokenizer,
         n_games: int,
     ) -> list[GameRecord]:
@@ -243,7 +243,6 @@ class SelfPlayGPU:
         model.eval()
 
         raw_games: list[dict[str, Any]] = []
-        batches = range(0, n_games, self._batch_size)
         try:
             for batch_start in range(0, n_games, self._batch_size):
                 batch_n = min(self._batch_size, n_games - batch_start)
@@ -291,6 +290,7 @@ class SelfPlayGPU:
                     outcome=float(item["outcome"]),
                     tensor=tensor,
                     move_weights=item.get("weights"),
+                    is_self_play=True,
                 )
             )
 

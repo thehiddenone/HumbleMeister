@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from enum import Enum
 from pathlib import Path
+
+
+class SelfPlayLossMode(str, Enum):
+    VALUE_ONLY = "value_only"
+    """Zero the policy loss on self-play games; only the value head trains on them."""
+    ADVANTAGE_WEIGHTED = "advantage_weighted"
+    """Policy gradient weighted by per-move Stockfish advantages (no label smoothing)."""
 
 
 def _get_device() -> str:
@@ -57,12 +65,13 @@ class ChessTrainingConfig:
     self_play_kv_cache: bool = True  # use KV cache during self-play generation
     self_play_value_weight: float = 0.5  # weight for value-blended move selection during self-play
     self_play_max_moves: int = 84  # hard draw cap for self-play games
+    self_play_loss_mode: str = SelfPlayLossMode.ADVANTAGE_WEIGHTED  # how self-play games contribute to the loss
     streaming: bool = False  # stream games in chunks instead of generating all at once
     streaming_chunk_size: int = 64  # games per streaming chunk (generation + grad accumulation)
 
     # checkpointing
     checkpoint_dir: str = "env/checkpoints"
-    checkpoint_every: int = 1  # save every N epochs
+    checkpoint_every: int = 50  # save every N epochs
     keep_last_n: int = 20  # keep only the last N checkpoints
 
     # logging
@@ -129,11 +138,11 @@ class ChessTrainingConfig:
         result.n_heads = 24
         result.n_layers = 24
         result.d_ff = 6144
-        result.train_batch_size = 4
+        result.train_batch_size = 16
         result.self_play_kv_cache = True
         result.streaming = True
-        result.streaming_chunk_size = 128
-        result.self_play_batch_size = 128
+        result.streaming_chunk_size = 512
+        result.self_play_batch_size = 512
         result.n_games = 4096
         return result
 
@@ -145,8 +154,10 @@ class ChessTrainingConfig:
         result.n_layers = 32
         result.d_ff = 8192
         result.train_batch_size = 2
+        result.self_play_kv_cache = True
         result.streaming = True
-        result.streaming_chunk_size = 64
+        result.streaming_chunk_size = 96
+        result.self_play_batch_size = 96
         result.n_games = 8192
         return result
 
