@@ -19,8 +19,19 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 from humblemeister.attention import make_causal_mask, make_padding_mask
-from humblemeister.config import ChessTrainingConfig, SelfPlayLossMode
-from humblemeister.data import ChessDataset, ChessGameBank, ChessTokenizer, GameRecord
+from humblemeister.config import (
+    BatchLengthSampling,
+    ChessTrainingConfig,
+    SelfPlayLossMode,
+    TrainingSelfAttention,
+)
+from humblemeister.data import (
+    ChessDataset,
+    ChessGameBank,
+    ChessTokenizer,
+    GameRecord,
+    LengthBucketBatchSampler,
+)
 from humblemeister.evaluation import StockfishEvaluator, compute_move_weights
 from humblemeister.transformer import ChessTransformer
 
@@ -108,6 +119,7 @@ class ChessTrainer:
             d_ff=config.d_ff,
             max_seq_len=config.max_seq_len,
             dropout=config.dropout,
+            pad_id=self.__tokenizer.PAD,
         ).to(self.__device)
 
         self.__optimizer = AdamW(self.__model.parameters(), lr=config.lr, weight_decay=0.1)
@@ -257,6 +269,59 @@ class ChessTrainer:
                 )
             )
 
+    def __build_dataloader(
+        self,
+        dataset: ChessDataset,
+        batch_size: int,
+        epoch: int,
+    ) -> DataLoader:
+        """Assemble a DataLoader for one training pass.
+
+        When training_self_attention is FLASH and batch_length_sampling is
+        BUCKETED, a LengthBucketBatchSampler yields fixed-length batches (zero
+        intra-batch padding). Any other combination falls back to the standard
+        shuffle=True loader.
+        """
+        fa_on = (
+            TrainingSelfAttention(self.__config.training_self_attention)
+            == TrainingSelfAttention.FLASH
+        )
+        bucket_on = (
+            BatchLengthSampling(self.__config.batch_length_sampling)
+            == BatchLengthSampling.BUCKETED
+        )
+        if fa_on and bucket_on:
+            sampler = LengthBucketBatchSampler(
+                dataset,
+                batch_size=batch_size,
+                n_games=min(self.__config.n_games, len(dataset)),
+                seed=self.__config.bucket_sampler_seed,
+                epoch=epoch,
+            )
+            return DataLoader(dataset, batch_sampler=sampler, collate_fn=dataset.collate)
+        return DataLoader(
+            dataset,
+            batch_size=min(batch_size, len(dataset)),
+            shuffle=True,
+            collate_fn=dataset.collate,
+        )
+
+    def __forward_train(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the model forward in training mode, dispatching between the
+        Flash-Attention-friendly causal-only path and the legacy combined
+        causal+padding mask path based on config.training_self_attention.
+        """
+        mode = TrainingSelfAttention(self.__config.training_self_attention)
+        if mode == TrainingSelfAttention.FLASH:
+            return self.__model(input_ids, mask=None, is_causal=True)
+        causal_mask = make_causal_mask(input_ids.size(1), self.__device)
+        padding_mask = make_padding_mask(attention_mask).to(self.__device)
+        return self.__model(input_ids, causal_mask + padding_mask)
+
     def __policy_loss(
         self,
         logits: torch.Tensor,
@@ -404,12 +469,7 @@ class ChessTrainer:
             # ---------------------------------------------------------- #
             self.__model.train()
 
-            dataloader = DataLoader(
-                self.__dataset,
-                batch_size=min(train_bs, len(self.__dataset)),
-                shuffle=True,
-                collate_fn=self.__dataset.collate,
-            )
+            dataloader = self.__build_dataloader(self.__dataset, train_bs, epoch)
 
             if outcome_scale > 0.0:
                 chunk_outcomes = torch.tensor(
@@ -428,10 +488,6 @@ class ChessTrainer:
                 has_evals = cast(torch.Tensor, batch["has_value_evals"]).to(self.__device)
                 is_self_play = cast(torch.Tensor, batch["is_self_play"]).to(self.__device)
 
-                causal_mask = make_causal_mask(input_ids.size(1), self.__device)
-                padding_mask = make_padding_mask(attention_mask).to(self.__device)
-                combined_mask = causal_mask + padding_mask
-
                 assert (
                     input_ids.max().item() < self.__tokenizer.vocab_size
                 ), f"token ID {input_ids.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
@@ -441,7 +497,7 @@ class ChessTrainer:
                 ), f"target token ID {targets.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
 
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
-                    logits, value_pred = self.__model(input_ids, combined_mask)
+                    logits, value_pred = self.__forward_train(input_ids, attention_mask)
 
                     policy_loss = self.__policy_loss(
                         logits, targets, move_weights, is_self_play, loss_mode
@@ -509,12 +565,7 @@ class ChessTrainer:
         batch_size = min(self.__config.train_batch_size, n_games)
         n_batches = math.ceil(n_games / batch_size)
 
-        dataloader = DataLoader(
-            self.__dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            collate_fn=self.__dataset.collate,
-        )
+        dataloader = self.__build_dataloader(self.__dataset, batch_size, epoch)
 
         # outcome weighting only applies when self-play games are present — those games
         # were generated by the model itself, so we can reinforce winning patterns.
@@ -545,10 +596,6 @@ class ChessTrainer:
             has_evals = cast(torch.Tensor, batch["has_value_evals"]).to(self.__device)
             is_self_play = cast(torch.Tensor, batch["is_self_play"]).to(self.__device)
 
-            causal_mask = make_causal_mask(input_ids.size(1), self.__device)
-            padding_mask = make_padding_mask(attention_mask).to(self.__device)
-            combined_mask = causal_mask + padding_mask
-
             assert (
                 input_ids.max().item() < self.__tokenizer.vocab_size
             ), f"token ID {input_ids.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
@@ -558,7 +605,7 @@ class ChessTrainer:
             ), f"target token ID {targets.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
 
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
-                logits, value_pred = self.__model(input_ids, combined_mask)
+                logits, value_pred = self.__forward_train(input_ids, attention_mask)
 
                 policy_loss = self.__policy_loss(
                     logits, targets, move_weights, is_self_play, loss_mode
@@ -650,11 +697,8 @@ class ChessTrainer:
                 )
                 break
 
-            dataloader = DataLoader(
-                self.__dataset,
-                batch_size=min(self.__config.train_batch_size, len(self.__dataset)),
-                shuffle=True,
-                collate_fn=self.__dataset.collate,
+            dataloader = self.__build_dataloader(
+                self.__dataset, self.__config.train_batch_size, epoch
             )
 
             total_loss = 0.0
@@ -670,9 +714,6 @@ class ChessTrainer:
                 if not has_evals.any():
                     continue
 
-                causal_mask = make_causal_mask(input_ids.size(1), self.__device)
-                padding_mask = make_padding_mask(attention_mask).to(self.__device)
-
                 # mask: real tokens in games that actually have Stockfish evals
                 token_mask = attention_mask.bool() & has_evals.unsqueeze(1)
 
@@ -680,7 +721,7 @@ class ChessTrainer:
                     continue
 
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
-                    _, value_pred = self.__model(input_ids, causal_mask + padding_mask)
+                    _, value_pred = self.__forward_train(input_ids, attention_mask)
                     loss = F.mse_loss(value_pred[token_mask], value_targets[token_mask])
 
                 if torch.isnan(loss) or torch.isinf(loss):

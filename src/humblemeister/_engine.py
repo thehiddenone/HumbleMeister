@@ -144,6 +144,7 @@ class ChessEngine:
             d_ff=config.d_ff,
             max_seq_len=config.max_seq_len,
             dropout=config.dropout,
+            pad_id=tokenizer.PAD,
         )
 
     # ------------------------------------------------------------------ #

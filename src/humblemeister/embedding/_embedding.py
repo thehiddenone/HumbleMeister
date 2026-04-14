@@ -10,9 +10,14 @@ import torch.nn as nn
 class TokenEmbedding(nn.Module):
     __embedding: nn.Embedding
 
-    def __init__(self, vocab_size: int, d_model: int) -> None:
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        padding_idx: int | None = None,
+    ) -> None:
         super().__init__()
-        self.__embedding = nn.Embedding(vocab_size, d_model)
+        self.__embedding = nn.Embedding(vocab_size, d_model, padding_idx=padding_idx)
 
     @property
     def embedding(self) -> nn.Embedding:
@@ -89,9 +94,10 @@ class InputEmbedding(nn.Module):
         max_seq_len: int = 512,
         dropout: float = 0.1,
         learned_pos_encoding: bool = True,
+        padding_idx: int | None = None,
     ) -> None:
         super().__init__()
-        self.__token_embedding = TokenEmbedding(vocab_size, d_model)
+        self.__token_embedding = TokenEmbedding(vocab_size, d_model, padding_idx=padding_idx)
         self.__positional_encoding = (
             LearnedPositionalEncoding(d_model, max_seq_len, dropout)
             if learned_pos_encoding

@@ -19,6 +19,7 @@ class ChessTransformer(nn.Module):
     __output: nn.Linear
     __value_head: nn.Sequential
     __n_layers: int
+    __pad_id: int | None
 
     def __init__(
         self,
@@ -29,10 +30,14 @@ class ChessTransformer(nn.Module):
         d_ff: int,
         max_seq_len: int = 512,
         dropout: float = 0.1,
+        pad_id: int | None = None,
     ) -> None:
         super().__init__()
 
-        self.__input_embedding = InputEmbedding(vocab_size, d_model, max_seq_len, dropout)
+        self.__pad_id = pad_id
+        self.__input_embedding = InputEmbedding(
+            vocab_size, d_model, max_seq_len, dropout, padding_idx=pad_id
+        )
         self.__blocks = nn.ModuleList(
             [TransformerBlock(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)]
         )
@@ -64,6 +69,15 @@ class ChessTransformer(nn.Module):
                 nn.init.normal_(p, mean=0.0, std=0.02)
             if "W_o" in name:  # scale down output projections
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self.__n_layers))
+
+        # re-zero the PAD row after the normal_() pass above overwrote it.
+        # nn.Embedding with padding_idx keeps gradients zero for this row, so
+        # once zeroed it stays zero — making PAD keys/values near-zero and
+        # bounding the "real token attends to PAD" contamination when training
+        # without a padding mask (see FLASH_ATTENTION.md).
+        if self.__pad_id is not None:
+            with torch.no_grad():
+                self.__input_embedding.token_embedding.embedding.weight[self.__pad_id].fill_(0)
 
     def forward(
         self,

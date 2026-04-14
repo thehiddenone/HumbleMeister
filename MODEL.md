@@ -75,14 +75,14 @@ Input token IDs  [batch, seq_len]
         │
         ├──────────────────────────┐
         ▼                          ▼
-┌──────────────┐         ┌──────────────────────┐
+┌──────────────┐         ┌───────────────────────┐
 │ Output head  │         │    Value head         │
 │ Linear       │         │ Linear(d→d/2)         │
 │ (weight-tied)│         │ GELU                  │
 │ [batch,seq,V]│         │ Linear(d/2→1)         │
 └──────────────┘         │ Tanh                  │
   policy logits          │ [batch, seq]  ∈[-1,1] │
-                         └──────────────────────┘
+                         └───────────────────────┘
                            position evaluation
 ```
 
@@ -282,6 +282,54 @@ Each epoch consists of two steps:
 1. generate_games(epoch)   → fills dataset with N games
 2. train_on_games(epoch)   → one pass over the dataset
 ```
+
+### Batch Assembly (Length Bucketing)
+
+Training batches are assembled by `LengthBucketBatchSampler`
+(`src/humblemeister/data/_bucket_sampler.py`), which guarantees every
+game inside a GPU batch has the **exact same sequence length** — so the
+collator pads nothing. This is what allows Flash Attention to run
+without the padded-token contamination described in
+[FLASH_ATTENTION.md](FLASH_ATTENTION.md).
+
+Per epoch, the sampler:
+
+1. Draws `n_games` indices uniformly without replacement from the full
+   corpus. Every game has equal probability of being included in the
+   epoch's sample regardless of its length.
+2. Groups the drawn indices by `len(game.tensor)`.
+3. For each length-group, yields `⌊n_L / batch_size⌋` full batches plus
+   one tail batch of size `n_L mod batch_size` (if non-zero). Tail
+   batches are single-length too — smaller than `batch_size` but zero
+   padding.
+4. Shuffles the full batch list so the trainer doesn't see all-short
+   then all-long batches in sequence.
+
+Determinism: the RNG stream is `bucket_sampler_seed + epoch`, so
+`(seed, epoch)` fully determines the epoch's sample and batch order.
+Resume needs no extra checkpoint state — passing the current epoch
+number reconstructs the sampler exactly.
+
+The sampler is controlled by two config flags:
+
+- `batch_length_sampling` (enum, default `BUCKETED`) — set to `RANDOM`
+  to bypass bucketing and fall back to `shuffle=True`. The `BUCKETED`
+  setting only activates when `training_self_attention == FLASH`; under
+  `PADDED_MASK` the padding mask already handles mixed-length batches
+  correctly, so the flag is ignored.
+- `bucket_sampler_seed` (int, default `0`) — seed base for per-epoch
+  sampling. Change across runs if you want different random subsets of
+  the corpus visited in each training run.
+
+Trade-offs:
+- **Pro**: zero intra-batch padding → Flash Attention runs on real
+  tokens only, no contamination; VRAM for the attention op matches
+  exactly the real sequence length.
+- **Con**: GPU batch size is no longer fixed. Long-tail length classes
+  with few games per epoch produce small tail batches (e.g. 1–10 games)
+  that under-utilise the GPU. If tail overhead becomes significant, a
+  ±k tail-merging fallback can be added as a follow-up — see mitigation
+  (1) in [FLASH_ATTENTION.md](FLASH_ATTENTION.md).
 
 ### Loss Function
 
@@ -632,3 +680,6 @@ Models are loaded from safetensors directories (the format produced by `save_mod
 | `advantage_temperature` | 1.0 | Sharpness of per-move weight distribution |
 | `outcome_warmup` | 20000 | Steps to ramp outcome weighting |
 | `keep_last_n` | 20 | Number of recent checkpoints to retain |
+| `training_self_attention` | `flash` | Flash Attention path (see [FLASH_ATTENTION.md](FLASH_ATTENTION.md)); `padded_mask` falls back to the legacy additive-mask path |
+| `batch_length_sampling` | `bucketed` | Batch assembly strategy; `bucketed` yields same-length batches (zero padding), `random` uses standard shuffled loader. Only active when `training_self_attention = flash`. |
+| `bucket_sampler_seed` | 0 | Seed base for the per-epoch uniform sample used by bucketed batching; combined with epoch number |

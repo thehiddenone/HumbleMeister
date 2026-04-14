@@ -13,6 +13,30 @@ class SelfPlayLossMode(str, Enum):
     """Policy gradient weighted by per-move Stockfish advantages (no label smoothing)."""
 
 
+class TrainingSelfAttention(str, Enum):
+    FLASH = "flash"
+    """Drop the padding mask and pass is_causal=True so SDPA dispatches to Flash
+    Attention. Padded positions still participate in attention but are zeroed out
+    of the loss via pad_mask."""
+    PADDED_MASK = "padded_mask"
+    """Build a combined causal + padding float-additive mask. Correct but forces
+    SDPA to the math backend (O(S²) attention-score memory)."""
+
+
+class BatchLengthSampling(str, Enum):
+    BUCKETED = "bucketed"
+    """Sample n_games games uniformly at random from the corpus, group them by
+    exact sequence length, and emit batches where every game shares the same
+    length. Eliminates intra-batch padding entirely, which is what Flash
+    Attention needs to run without padded-token contamination. Only active when
+    training_self_attention == FLASH; ignored otherwise (the PADDED_MASK path
+    already handles arbitrary-length batches correctly via the padding mask)."""
+    RANDOM = "random"
+    """Standard shuffle=True DataLoader — each batch is a random draw from the
+    corpus, padded to the longest game in the batch. Use for parity testing or
+    when debugging bucketing behaviour."""
+
+
 def _get_device() -> str:
     import torch
 
@@ -37,6 +61,18 @@ class ChessTrainingConfig:
     max_seq_len: int = 512
     dropout: float = 0.1
     bf16: bool = True  # bfloat16 mixed precision — halves activation memory, no GradScaler needed
+    training_self_attention: str = TrainingSelfAttention.FLASH
+    """How attention is invoked during training forward passes. FLASH enables the
+    Flash Attention kernel (recommended); PADDED_MASK preserves the legacy
+    additive-mask path."""
+    batch_length_sampling: str = BatchLengthSampling.BUCKETED
+    """How batches are assembled. Only takes effect when training_self_attention
+    is FLASH. Under PADDED_MASK this flag is ignored and the trainer uses
+    standard random shuffling (the padding mask makes bucketing unnecessary)."""
+    bucket_sampler_seed: int = 0
+    """Seed base for the per-epoch uniform sample used by BUCKETED sampling.
+    Combined with the epoch number so each epoch draws a different subset
+    deterministically."""
 
     # training
     n_games: int = 512  # total games loaded per epoch
