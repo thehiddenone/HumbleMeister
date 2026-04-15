@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import chess
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
@@ -12,9 +11,8 @@ from ._tokenizer import ChessTokenizer
 
 @dataclass
 class GameRecord:
-    moves: list[chess.Move]
     outcome: float  # 1.0 = white win, 0.0 = black win, 0.5 = draw
-    tensor: torch.Tensor
+    tensor: torch.Tensor  # int64, [BOS, ..., EOS]
     move_weights: torch.Tensor | None = None  # [n_moves + 1], aligned with targets
     value_evals: torch.Tensor | None = (
         None  # [n_moves + 1], aligned with input_ids; tanh-normalized White's perspective

@@ -322,7 +322,6 @@ class SelfPlayCPU:
                     continue
                 records.append(
                     GameRecord(
-                        moves=moves,
                         outcome=float(item["outcome"]),
                         tensor=tensor,
                         move_weights=item.get("weights"),

@@ -8,6 +8,8 @@ import os
 import random
 import select
 import tempfile
+import time
+import traceback
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,10 +19,10 @@ import chess
 import chess.engine
 import chess.pgn
 import py7zr
-import time
 import torch
 import torch.nn.functional as F
-import traceback
+
+from ._tokenizer import ChessTokenizer
 
 # ipywidgets is optional — only available inside a Jupyter environment.
 # Import once at module load; assign None fallbacks so every reference is
@@ -255,7 +257,7 @@ def _read_chess_file(args: tuple[str, int | None, io.TextIOWrapper | None]) -> l
     file_path, elo_filter, log = args
 
     if log is not None:
-        log.write(f'_read_chess_file {file_path}\n')
+        log.write(f"_read_chess_file {file_path}\n")
 
     content = []
     if file_path.endswith(".7z"):
@@ -272,8 +274,8 @@ def _read_chess_file(args: tuple[str, int | None, io.TextIOWrapper | None]) -> l
             names = zf.namelist()
             if len(names) != 1:
                 return []
-            with zf.open(names[0]) as f:
-                content = f.read().decode("utf-8", errors="ignore").splitlines()
+            with zf.open(names[0]) as zf_entry:
+                content = zf_entry.read().decode("utf-8", errors="ignore").splitlines()
     elif file_path.endswith(".pgn"):
         with open(file_path, "rt") as f:
             content = f.read().splitlines()
@@ -299,7 +301,7 @@ def _read_chess_file(args: tuple[str, int | None, io.TextIOWrapper | None]) -> l
             pass
 
     if log is not None:
-        log.write(f'len(content) = {len(content)}\n')
+        log.write(f"len(content) = {len(content)}\n")
 
     for line in content:
         if line.startswith('[Event "'):
@@ -309,7 +311,7 @@ def _read_chess_file(args: tuple[str, int | None, io.TextIOWrapper | None]) -> l
     _flush(acc)
 
     if log is not None:
-        log.write(f'len(results) = {len(results)}\n')
+        log.write(f"len(results) = {len(results)}\n")
 
     return results
 
@@ -327,9 +329,9 @@ def _convert_file(
     """
     file_path, elo_filter, out_dir, stockfish_path, depth, temperature = args
 
-    with open(file_path + '.log', 'wt', buffering=1) as log:
+    with open(file_path + ".log", "wt", buffering=1) as log:
 
-        log.write(f'starting conversion of {file_path}\n')
+        log.write(f"starting conversion of {file_path}\n")
 
         # derive a unique stem from the input filename (strip all archive extensions)
         stem = Path(file_path).name
@@ -350,26 +352,27 @@ def _convert_file(
                 len_games += len(shard)
                 idx += 1
                 pt_path = os.path.join(out_dir, f"{stem}_{idx:04d}.pt")
-            log.write(f'alrady converted {file_path}: {stem}, {len_games}, {n_shards}\n')
+            log.write(f"alrady converted {file_path}: {stem}, {len_games}, {n_shards}\n")
             return (stem, len_games, n_shards)
 
         games = _read_chess_file((file_path, elo_filter, log))
         if not games:
-            log.write(f'failure: no games\n')
+            log.write(f"failure: no games\n")
             return (stem, 0, 0)
 
-        log.write(f'read {len(games)} games\n')
+        log.write(f"read {len(games)} games\n")
 
         try:
             engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
         except Exception:
-            log.write(f'failure: failed to init stockfish\n')
+            log.write(f"failure: failed to init stockfish\n")
             return (stem, 0, 0)
 
         t0 = time.time()
         conversion_time = 0.0
         eval_time = 0.0
         weighting_time = 0.0
+        tokenizer = ChessTokenizer()
         if engine is not None:
             try:
                 for game_idx, item in enumerate(games):
@@ -378,6 +381,7 @@ def _convert_file(
                     try:
                         t_c = time.time()
                         moves = [chess.Move.from_uci(u) for u in moves_uci]
+                        item["tok_moves"] = tokenizer.encode_game_tensor(moves).to(torch.int16)
                         board = chess.Board()
                         boards: list[chess.Board] = [board.copy()]
                         for move in moves:
@@ -426,27 +430,53 @@ def _convert_file(
                         )
                         weighting_time += time.time() - t_w
                     except Exception:
-                        log.write(f'exception was raised: {traceback.format_exc()}\n')
+                        log.write(f"exception was raised: {traceback.format_exc()}\n")
                         item["weights"] = torch.ones(n_moves + 1)
                         item["value_evals"] = None
 
                     game_count = game_idx + 1
                     if game_idx > 0 and game_count % 10 == 0:
                         dt = time.time() - t0
-                        log.write(f'converted {game_idx + 1} games so far, elapsed time {dt}, {dt / game_count} per game\n')
-                        log.write(f'conversion_time = {conversion_time} {conversion_time/game_count}\n')
-                        log.write(f'eval_time = {eval_time} {eval_time/game_count}\n')
-                        log.write(f'weighting_time = {weighting_time} {weighting_time/game_count}\n')
-                        log.write('---\n')
+                        log.write(
+                            f"converted {game_idx + 1} games so far, elapsed time {dt}, {dt / game_count} per game\n"
+                        )
+                        log.write(
+                            f"conversion_time = {conversion_time} {conversion_time/game_count}\n"
+                        )
+                        log.write(f"eval_time = {eval_time} {eval_time/game_count}\n")
+                        log.write(
+                            f"weighting_time = {weighting_time} {weighting_time/game_count}\n"
+                        )
+                        log.write("---\n")
             finally:
                 engine.quit()
-                log.write('closing the engine')
+                log.write("closing the engine")
 
         # write shards to disk immediately — no data sent back to parent
+        vocab_hash = tokenizer.vocab_hash()
         n_shards = 0
         for start in range(0, len(games), _SHARD_SIZE):
             shard = games[start : start + _SHARD_SIZE]
-            torch.save(shard, os.path.join(out_dir, f"{stem}_{n_shards:04d}.pt"))
+            # games that failed tokenisation before the tok_moves assignment are
+            # skipped; successful items drop "moves" to keep shards small.
+            games_out: list[dict[str, Any]] = []
+            for g in shard:
+                if "tok_moves" not in g:
+                    continue
+                games_out.append(
+                    {
+                        "tok_moves": g["tok_moves"],
+                        "outcome": g["outcome"],
+                        "weights": g.get("weights"),
+                        "value_evals": g.get("value_evals"),
+                    }
+                )
+            payload = {
+                "tokenizer_version": ChessTokenizer.VERSION,
+                "vocab_hash": vocab_hash,
+                "games": games_out,
+            }
+            torch.save(payload, os.path.join(out_dir, f"{stem}_{n_shards:04d}.pt"))
             n_shards += 1
 
     return (stem, len(games), n_shards)
@@ -462,7 +492,7 @@ class _SilentGameBuilder(chess.pgn.GameBuilder[chess.pgn.Game]):
 
 @dataclass
 class _BankRecord:
-    moves: list[chess.Move]
+    tokens: torch.Tensor  # int16, [BOS, ..., EOS] — already tokenised
     outcome: float
     move_weights: torch.Tensor | None  # [n_moves + 1]; None until externally evaluated
     value_evals: torch.Tensor | None  # [n_moves + 1]; tanh-normalized, White's perspective
@@ -515,13 +545,19 @@ class ChessGameBank:
         n_procs = min(n_workers, total_files)
         files_done = 0
 
+        tokenizer = ChessTokenizer()
         ctx = multiprocessing.get_context("fork")
         with ctx.Pool(processes=n_procs) as pool:
             for game_dicts in pool.imap_unordered(_read_chess_file, args):
                 for gd in game_dicts:
+                    try:
+                        moves = [chess.Move.from_uci(uci) for uci in gd["moves"]]
+                        tokens = tokenizer.encode_game_tensor(moves).to(torch.int16)
+                    except KeyError:
+                        continue
                     self.__records.append(
                         _BankRecord(
-                            moves=[chess.Move.from_uci(uci) for uci in gd["moves"]],
+                            tokens=tokens,
                             outcome=gd["outcome"],
                             move_weights=None,
                             value_evals=None,
@@ -628,8 +664,7 @@ class ChessGameBank:
 
         # rename per-file shards to sequential shard_XXXX.pt
         tmp_shards = sorted(
-            sp for sp in p.iterdir()
-            if sp.suffix == ".pt" and sp.name != "meta.json"
+            sp for sp in p.iterdir() if sp.suffix == ".pt" and sp.name != "meta.json"
         )
         for i, old in enumerate(tmp_shards):
             old.rename(p / f"shard_{i:04d}.pt")
@@ -651,9 +686,7 @@ class ChessGameBank:
                 f"{len(tmp_shards)} shards in {p}/</small>"
             )
 
-        print(
-            f"converted {total_games:,} games to {len(tmp_shards)} shards in {p}/"
-        )
+        print(f"converted {total_games:,} games to {len(tmp_shards)} shards in {p}/")
 
     # ------------------------------------------------------------------ #
     #  Stockfish evaluation                                                #
@@ -919,17 +952,23 @@ class ChessGameBank:
         if bar is not None and status is not None:
             _display(widgets.HBox([bar, status]))  # type: ignore[no-untyped-call]
 
+        tokenizer = ChessTokenizer()
+        vocab_hash = tokenizer.vocab_hash()
         for i, shard in enumerate(shards):
-            data = [
-                {
-                    "moves": [m.uci() for m in r.moves],
-                    "outcome": r.outcome,
-                    "weights": r.move_weights,
-                    "value_evals": r.value_evals,
-                }
-                for r in shard
-            ]
-            torch.save(data, p / f"shard_{i:04d}.pt")
+            payload = {
+                "tokenizer_version": ChessTokenizer.VERSION,
+                "vocab_hash": vocab_hash,
+                "games": [
+                    {
+                        "tok_moves": r.tokens,
+                        "outcome": r.outcome,
+                        "weights": r.move_weights,
+                        "value_evals": r.value_evals,
+                    }
+                    for r in shard
+                ],
+            }
+            torch.save(payload, p / f"shard_{i:04d}.pt")
             if bar is not None and status is not None:
                 bar.value = i + 1
                 status.value = f"<small>{i + 1} / {len(shards)} shards</small>"
@@ -960,18 +999,46 @@ class ChessGameBank:
         if bar is not None and status is not None:
             _display(widgets.HBox([bar, status]))  # type: ignore[no-untyped-call]
 
+        tokenizer = ChessTokenizer()
+        expected_hash = tokenizer.vocab_hash()
         for i in range(n_shards):
-            shard: list[dict[str, Any]] = torch.load(p / f"shard_{i:04d}.pt", weights_only=False)
-            for item in shard:
-                moves = [chess.Move.from_uci(uci) for uci in item["moves"]]
-                self.__records.append(
-                    _BankRecord(
-                        moves=moves,
-                        outcome=float(item["outcome"]),
-                        move_weights=item.get("weights"),
-                        value_evals=item.get("value_evals"),
+            payload: Any = torch.load(p / f"shard_{i:04d}.pt", weights_only=False)
+
+            if isinstance(payload, dict) and "games" in payload:
+                # new schema: dict wrapper with vocab stamp + tokenised games
+                shard_hash = payload.get("vocab_hash")
+                if shard_hash != expected_hash:
+                    raise RuntimeError(
+                        f"shard {i}: vocab_hash mismatch "
+                        f"(shard={shard_hash}, tokenizer={expected_hash}) — "
+                        f"tokens would decode to wrong moves"
                     )
-                )
+                for item in payload["games"]:
+                    self.__records.append(
+                        _BankRecord(
+                            tokens=item["tok_moves"],
+                            outcome=float(item["outcome"]),
+                            move_weights=item.get("weights"),
+                            value_evals=item.get("value_evals"),
+                        )
+                    )
+            else:
+                # legacy schema: list[dict] with "moves" (UCI strings)
+                for item in payload:
+                    if "tok_moves" in item:
+                        tokens = item["tok_moves"]
+                    else:
+                        moves = [chess.Move.from_uci(uci) for uci in item["moves"]]
+                        tokens = tokenizer.encode_game_tensor(moves).to(torch.int16)
+                        del moves
+                    self.__records.append(
+                        _BankRecord(
+                            tokens=tokens,
+                            outcome=float(item["outcome"]),
+                            move_weights=item.get("weights"),
+                            value_evals=item.get("value_evals"),
+                        )
+                    )
             if bar is not None and status is not None:
                 bar.value = i + 1
                 status.value = f"<small>{i + 1} / {n_shards} shards &mdash; {len(self.__records):,} games</small>"
@@ -983,20 +1050,24 @@ class ChessGameBank:
         random.shuffle(self.__records)
 
     # ------------------------------------------------------------------ #
-    #  Access                                                              #
+    #  Access                                                            #
     # ------------------------------------------------------------------ #
 
     def get_random_game(
         self,
-    ) -> tuple[list[chess.Move], float, torch.Tensor | None, torch.Tensor | None]:
-        """Returns (moves, outcome, move_weights, value_evals). Both tensors are None until externally evaluated."""
+    ) -> tuple[torch.Tensor, float, torch.Tensor | None, torch.Tensor | None]:
+        """Returns (tokens, outcome, move_weights, value_evals).
+
+        ``tokens`` is the int16 tensor [BOS, ...moves, EOS]. Weight/eval tensors
+        are None until the bank has been Stockfish-evaluated.
+        """
         if self.__cursor >= len(self.__records):
             random.shuffle(self.__records)
             self.__cursor = 0
 
         record = self.__records[self.__cursor]
         self.__cursor += 1
-        return record.moves, record.outcome, record.move_weights, record.value_evals
+        return record.tokens, record.outcome, record.move_weights, record.value_evals
 
     def __len__(self) -> int:
         return len(self.__records)

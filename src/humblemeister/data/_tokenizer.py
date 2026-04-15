@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Optional
+import hashlib
+from typing import ClassVar, Optional
 
 import chess
 import torch
@@ -13,6 +14,8 @@ class ChessTokenizer:
     BOS = 1
     EOS = 2
     SPECIAL_TOKENS = {"<PAD>": 0, "<BOS>": 1, "<EOS>": 2}
+    # bump when tokenizer output semantics change (not just code refactors).
+    VERSION: ClassVar[int] = 1
 
     __move_to_id: dict[str, int]
     __id_to_move: dict[int, str]
@@ -57,6 +60,12 @@ class ChessTokenizer:
     @property
     def vocab_size(self) -> int:
         return self.__vocab_size
+
+    def vocab_hash(self) -> str:
+        """Short, stable hash of the (uci, id) mapping. Used to verify that a
+        saved shard was produced by a tokenizer with the same vocabulary."""
+        items = sorted(self.__move_to_id.items())
+        return hashlib.sha256(repr(items).encode()).hexdigest()[:16]
 
     def encode_move(self, move: chess.Move) -> int:
         return self.__move_to_id[move.uci()]

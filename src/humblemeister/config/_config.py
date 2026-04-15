@@ -101,7 +101,9 @@ class ChessTrainingConfig:
     self_play_kv_cache: bool = True  # use KV cache during self-play generation
     self_play_value_weight: float = 0.5  # weight for value-blended move selection during self-play
     self_play_max_moves: int = 84  # hard draw cap for self-play games
-    self_play_loss_mode: str = SelfPlayLossMode.ADVANTAGE_WEIGHTED  # how self-play games contribute to the loss
+    self_play_loss_mode: str = (
+        SelfPlayLossMode.ADVANTAGE_WEIGHTED
+    )  # how self-play games contribute to the loss
     streaming: bool = False  # stream games in chunks instead of generating all at once
     streaming_chunk_size: int = 64  # games per streaming chunk (generation + grad accumulation)
 
@@ -174,12 +176,12 @@ class ChessTrainingConfig:
         result.n_heads = 24
         result.n_layers = 24
         result.d_ff = 6144
-        result.train_batch_size = 16
+        result.train_batch_size = 64
         result.self_play_kv_cache = True
         result.streaming = True
-        result.streaming_chunk_size = 512
-        result.self_play_batch_size = 512
-        result.n_games = 4096
+        result.streaming_chunk_size = 2048
+        result.self_play_batch_size = 256
+        result.n_games = 16384
         return result
 
     @classmethod

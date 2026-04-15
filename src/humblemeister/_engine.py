@@ -109,7 +109,9 @@ class ChessEngine:
     ) -> ChessEngine:
         checkpoint = torch.load(path, map_location=device, weights_only=True)
         config_data = checkpoint["config"]
-        config = ChessTrainingConfig(**config_data) if isinstance(config_data, dict) else config_data
+        config = (
+            ChessTrainingConfig(**config_data) if isinstance(config_data, dict) else config_data
+        )
         tokenizer = ChessTokenizer()
         model = cls._build_model(config, tokenizer)
         model.load_state_dict(checkpoint["model_state"])

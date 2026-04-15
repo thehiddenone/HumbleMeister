@@ -80,7 +80,9 @@ def sample_move(
         )  # [n_legal, seq_len+1]
 
         with torch.no_grad():
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16 and device.type == "cuda"):
+            with torch.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=bf16 and device.type == "cuda"
+            ):
                 value_logits, value_preds = model(value_input, is_causal=True)
         del value_logits, value_input
         # value_preds: [n_legal, seq_len+1] — take the last position
@@ -212,7 +214,9 @@ def sample_move_kv_cache(
         # one generate_step over all legal move tokens at once
         move_tokens = legal_token_ids.unsqueeze(1)  # [n_legal, 1]
         with torch.no_grad():
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16 and device.type == "cuda"):
+            with torch.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=bf16 and device.type == "cuda"
+            ):
                 _, value_preds, _ = model.generate_step(move_tokens, expanded_cache)
         # value_preds: [n_legal, 1] → squeeze to [n_legal]
         value_scores = value_preds.squeeze(1)

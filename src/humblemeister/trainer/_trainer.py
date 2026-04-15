@@ -7,7 +7,7 @@ import shutil
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import safetensors.torch as st
 import torch
@@ -221,34 +221,19 @@ class ChessTrainer:
 
     def __generate_from_bank(self, target: int) -> None:
         while len(self.__gamebank) > 0 and len(self.__dataset) < target:
-            moves, outcome, weights, value_evals = self.__gamebank.get_random_game()
-            if not moves:
+            tokens, outcome, weights, value_evals = self.__gamebank.get_random_game()
+            n_moves = tokens.numel() - 2  # subtract BOS + EOS
+            if n_moves <= 0:
+                continue
+            if n_moves > self.__config.max_moves:
                 continue
 
-            # validate all moves are in tokenizer vocabulary
-            try:
-                if len(moves) > self.__config.max_moves:
-                    print(
-                        f"  skipping game: too many moves {len(moves)} > {self.__config.max_moves}"
-                    )
-                    continue
-
-                tensor = self.__tokenizer.encode_game_tensor(moves)
-                if tensor.max().item() >= self.__tokenizer.vocab_size:
-                    print(
-                        f"  skipping game: token ID {tensor.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
-                    )
-                    continue
-                if tensor.min().item() < 0:
-                    print(f"  skipping game: negative token ID {tensor.min().item()}")
-                    continue
-            except KeyError as e:
-                print(f"  skipping game: unknown move {e}")
-                continue
+            tensor = tokens.to(torch.long)
 
             # use pre-computed weights from the bank if available;
             # fall back to on-the-fly evaluation only if the bank wasn't pre-evaluated
             if weights is None and self.__evaluator is not None:
+                moves = self.__tokenizer.decode_game(tokens.tolist())
                 t0 = time.perf_counter()
                 weights = compute_move_weights(
                     moves,
@@ -261,7 +246,6 @@ class ChessTrainer:
 
             self.__dataset.add_game(
                 GameRecord(
-                    moves=moves,
                     outcome=outcome,
                     tensor=tensor,
                     move_weights=weights,
@@ -274,7 +258,7 @@ class ChessTrainer:
         dataset: ChessDataset,
         batch_size: int,
         epoch: int,
-    ) -> DataLoader:
+    ) -> DataLoader[Any]:
         """Assemble a DataLoader for one training pass.
 
         When training_self_attention is FLASH and batch_length_sampling is
@@ -287,8 +271,7 @@ class ChessTrainer:
             == TrainingSelfAttention.FLASH
         )
         bucket_on = (
-            BatchLengthSampling(self.__config.batch_length_sampling)
-            == BatchLengthSampling.BUCKETED
+            BatchLengthSampling(self.__config.batch_length_sampling) == BatchLengthSampling.BUCKETED
         )
         if fa_on and bucket_on:
             sampler = LengthBucketBatchSampler(
@@ -317,10 +300,12 @@ class ChessTrainer:
         """
         mode = TrainingSelfAttention(self.__config.training_self_attention)
         if mode == TrainingSelfAttention.FLASH:
-            return self.__model(input_ids, mask=None, is_causal=True)
+            logits, value = self.__model(input_ids, mask=None, is_causal=True)
+            return logits, value
         causal_mask = make_causal_mask(input_ids.size(1), self.__device)
         padding_mask = make_padding_mask(attention_mask).to(self.__device)
-        return self.__model(input_ids, causal_mask + padding_mask)
+        logits, value = self.__model(input_ids, causal_mask + padding_mask)
+        return logits, value
 
     def __policy_loss(
         self,
@@ -349,18 +334,27 @@ class ChessTrainer:
 
         if loss_mode == SelfPlayLossMode.VALUE_ONLY:
             per_token = F.cross_entropy(
-                logits_flat, targets_flat,
-                ignore_index=pad, label_smoothing=0.1, reduction="none",
+                logits_flat,
+                targets_flat,
+                ignore_index=pad,
+                label_smoothing=0.1,
+                reduction="none",
             )
             policy_mask = (~is_sp_flat).float()
         else:  # ADVANTAGE_WEIGHTED
             smooth = F.cross_entropy(
-                logits_flat, targets_flat,
-                ignore_index=pad, label_smoothing=0.1, reduction="none",
+                logits_flat,
+                targets_flat,
+                ignore_index=pad,
+                label_smoothing=0.1,
+                reduction="none",
             )
             raw = F.cross_entropy(
-                logits_flat, targets_flat,
-                ignore_index=pad, label_smoothing=0.0, reduction="none",
+                logits_flat,
+                targets_flat,
+                ignore_index=pad,
+                label_smoothing=0.0,
+                reduction="none",
             )
             per_token = torch.where(is_sp_flat, raw, smooth)
             policy_mask = torch.ones(targets_flat.size(0), device=targets_flat.device)
@@ -765,7 +759,9 @@ class ChessTrainer:
 
         end_epoch = max_epochs or self.__config.n_epochs
         self.__scheduler = get_scheduler(
-            self.__optimizer, end_epoch, self.__config.warmup_epochs,
+            self.__optimizer,
+            end_epoch,
+            self.__config.warmup_epochs,
         )
         self.__train_loop(
             start_epoch=0,
@@ -821,11 +817,14 @@ class ChessTrainer:
 
         os.makedirs(self.checkpoints_path, exist_ok=True)
         self.__scheduler = get_scheduler(
-            self.__optimizer, target_end, self.__config.warmup_epochs,
+            self.__optimizer,
+            target_end,
+            self.__config.warmup_epochs,
             start_epoch=current,
         )
-        print(f"LR curve: epoch {current} → {target_end} "
-              f"(warmup {self.__config.warmup_epochs})")
+        print(
+            f"LR curve: epoch {current} → {target_end} " f"(warmup {self.__config.warmup_epochs})"
+        )
         self.__train_loop(
             start_epoch=current,
             end_epoch=target_end,
@@ -929,7 +928,7 @@ class ChessTrainer:
         games = self.__dataset.games
         n_games = len(games)
         outcomes = [g.outcome for g in games]
-        lengths = [len(g.moves) for g in games]
+        lengths = [max(g.tensor.numel() - 2, 0) for g in games]
 
         avg_len = sum(lengths) / max(n_games, 1)
         win_rate = sum(1 for o in outcomes if o == 1.0) / max(n_games, 1)
@@ -979,7 +978,7 @@ class ChessTrainer:
         for old in checkpoints[: -self.__config.keep_last_n]:
             old.unlink()
 
-    def __load_latest_checkpoint(self) -> dict | None:
+    def __load_latest_checkpoint(self) -> dict[str, Any] | None:
         """Load the latest checkpoint, restoring model and optimizer state.
 
         Returns the raw checkpoint dict (with keys ``epoch``, ``end_epoch``,
@@ -1006,7 +1005,7 @@ class ChessTrainer:
         print(
             f"resumed from {path.name} (epoch {checkpoint['epoch']}, loss {checkpoint['loss']:.4f})"
         )
-        return checkpoint
+        return dict(checkpoint)
 
     def _check_tensors(self, label: str, **tensors: torch.Tensor) -> bool:
         """Returns True if any tensor contains NaN or inf."""

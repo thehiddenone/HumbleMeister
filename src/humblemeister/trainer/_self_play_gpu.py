@@ -19,10 +19,9 @@ from ._self_play_cpu import _stockfish_outcome
 
 def _select_cache_rows(cache: KVCache, indices: torch.Tensor) -> KVCache:
     """Return a new KVCache containing only the rows at `indices`."""
-    return KVCache(layers=[
-        LayerKVCache(k=layer.k[indices], v=layer.v[indices])
-        for layer in cache.layers
-    ])
+    return KVCache(
+        layers=[LayerKVCache(k=layer.k[indices], v=layer.v[indices]) for layer in cache.layers]
+    )
 
 
 class SelfPlayGPU:
@@ -129,8 +128,11 @@ class SelfPlayGPU:
                     outcome = {"1-0": 1.0, "0-1": 0.0, "1/2-1/2": 0.5}.get(result, 0.5)
                 elif len(board.move_stack) >= self._max_moves:
                     outcome = _stockfish_outcome(
-                        board, self._stockfish_path, self._stockfish_depth,
-                        self._draw_lo, self._draw_hi,
+                        board,
+                        self._stockfish_path,
+                        self._stockfish_depth,
+                        self._draw_lo,
+                        self._draw_hi,
                     )
                 else:
                     still_active.append(i)
@@ -286,7 +288,6 @@ class SelfPlayGPU:
                 continue
             records.append(
                 GameRecord(
-                    moves=moves,
                     outcome=float(item["outcome"]),
                     tensor=tensor,
                     move_weights=item.get("weights"),
