@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import gc
 import json
 import math
 import os
@@ -228,7 +230,10 @@ class ChessTrainer:
             if n_moves > self.__config.max_moves:
                 continue
 
-            tensor = tokens.to(torch.long)
+            # Keep the bank's int16 representation directly in the GameRecord.
+            # The cast to int64 happens in ChessDataset.collate, right before
+            # pad_sequence, so the larger dtype is only alive for one batch.
+            tensor = tokens
 
             # use pre-computed weights from the bank if available;
             # fall back to on-the-fly evaluation only if the bank wasn't pre-evaluated
@@ -482,14 +487,6 @@ class ChessTrainer:
                 has_evals = cast(torch.Tensor, batch["has_value_evals"]).to(self.__device)
                 is_self_play = cast(torch.Tensor, batch["is_self_play"]).to(self.__device)
 
-                assert (
-                    input_ids.max().item() < self.__tokenizer.vocab_size
-                ), f"token ID {input_ids.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
-                assert input_ids.min().item() >= 0, f"negative token ID {input_ids.min().item()}"
-                assert (
-                    targets.max().item() < self.__tokenizer.vocab_size
-                ), f"target token ID {targets.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
-
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
                     logits, value_pred = self.__forward_train(input_ids, attention_mask)
 
@@ -502,7 +499,7 @@ class ChessTrainer:
                         value_loss_t = F.mse_loss(value_pred[token_mask], value_targets[token_mask])
                         loss = policy_loss + self.__config.value_loss_weight * value_loss_t
                     else:
-                        value_loss_t = torch.tensor(0.0, device=self.__device)
+                        value_loss_t = policy_loss.new_zeros(())
                         loss = policy_loss
 
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -532,16 +529,12 @@ class ChessTrainer:
             if p.grad is not None:
                 p.grad /= total_mini_batches
 
-        for name, p in self.__model.named_parameters():
-            if torch.isnan(p).any() or torch.isinf(p).any():
-                print(f"  bad weight: {name} nan={torch.isnan(p).any()} inf={torch.isinf(p).any()}")
-
-        if any(torch.isnan(p.grad).any() for p in self.__model.parameters() if p.grad is not None):
-            print("warning: NaN gradients detected, skipping update")
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.__model.parameters(), max_norm=1.0)
+        if not torch.isfinite(grad_norm):
+            print(f"warning: non-finite gradient norm ({grad_norm:.4g}), skipping update")
             self.__optimizer.zero_grad()
             return total_loss / total_mini_batches, total_value_loss / total_mini_batches, False
 
-        torch.nn.utils.clip_grad_norm_(self.__model.parameters(), max_norm=1.0)
         self.__optimizer.step()
         self.__optimizer.zero_grad()
 
@@ -590,14 +583,6 @@ class ChessTrainer:
             has_evals = cast(torch.Tensor, batch["has_value_evals"]).to(self.__device)
             is_self_play = cast(torch.Tensor, batch["is_self_play"]).to(self.__device)
 
-            assert (
-                input_ids.max().item() < self.__tokenizer.vocab_size
-            ), f"token ID {input_ids.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
-            assert input_ids.min().item() >= 0, f"negative token ID {input_ids.min().item()}"
-            assert (
-                targets.max().item() < self.__tokenizer.vocab_size
-            ), f"target token ID {targets.max().item()} >= vocab_size {self.__tokenizer.vocab_size}"
-
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.__config.bf16):
                 logits, value_pred = self.__forward_train(input_ids, attention_mask)
 
@@ -611,7 +596,7 @@ class ChessTrainer:
                     value_loss = F.mse_loss(value_pred[token_mask], value_targets[token_mask])
                     loss = policy_loss + self.__config.value_loss_weight * value_loss
                 else:
-                    value_loss = torch.tensor(0.0, device=self.__device)
+                    value_loss = policy_loss.new_zeros(())
                     loss = policy_loss
 
             if torch.isnan(loss) or torch.isinf(loss):
@@ -633,18 +618,15 @@ class ChessTrainer:
             self.__optimizer.zero_grad()
             return total_loss, total_value_loss, False
 
-        # check weights
-        for name, p in self.__model.named_parameters():
-            if torch.isnan(p).any() or torch.isinf(p).any():
-                print(f"  bad weight: {name} nan={torch.isnan(p).any()} inf={torch.isinf(p).any()}")
-
-        # check gradients for NaN before stepping
-        if any(torch.isnan(p.grad).any() for p in self.__model.parameters() if p.grad is not None):
-            print("warning: NaN gradients detected, skipping update")
+        # clip_grad_norm_ computes the global gradient norm as a by-product.
+        # Checking that single scalar is far cheaper than iterating every parameter
+        # with torch.isnan(p.grad).any() (which allocates a bool tensor per param).
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.__model.parameters(), max_norm=1.0)
+        if not torch.isfinite(grad_norm):
+            print(f"warning: non-finite gradient norm ({grad_norm:.4g}), skipping update")
             self.__optimizer.zero_grad()
             return total_loss, total_value_loss, False
 
-        torch.nn.utils.clip_grad_norm_(self.__model.parameters(), max_norm=1.0)
         self.__optimizer.step()
         self.__optimizer.zero_grad()
 
@@ -802,6 +784,10 @@ class ChessTrainer:
 
         cp_epoch: int = checkpoint["epoch"]
         cp_end: int = checkpoint.get("end_epoch", self.__config.n_epochs)
+        # Release the checkpoint dict (which holds a full model_state copy) before
+        # entering the long-running training loop — otherwise it lives on the stack
+        # for the entire training run, wasting RAM proportional to model size.
+        del checkpoint
 
         current = start_epoch if start_epoch is not None else cp_epoch + 1
         if end_epoch is not None:
@@ -906,6 +892,18 @@ class ChessTrainer:
             # keep memory under control
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+
+            # Every 50 epochs: run the cyclic GC and ask glibc to return any
+            # freed-but-unreturned pages to the OS.  Python's allocator holds
+            # arenas even after freeing objects; malloc_trim(0) releases them,
+            # preventing the process RSS from growing indefinitely due to
+            # heap fragmentation from the repeated per-epoch alloc/free churn.
+            if epoch > 0 and epoch % 50 == 0:
+                gc.collect()
+                try:
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass  # non-Linux or libc unavailable — silently skip
 
         self.__save_checkpoint(end_epoch - 1, loss)
         self.writer.close()

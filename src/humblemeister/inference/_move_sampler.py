@@ -46,7 +46,7 @@ def sample_move(
         raise RuntimeError("no legal moves available")
 
     # ------------------------------------------------------------------ #
-    #  Step 1: policy logits at the current position                      #
+    #  Step 1: policy logits at the current position                     #
     # ------------------------------------------------------------------ #
     input_ids = torch.tensor([move_history], dtype=torch.long, device=device)  # [1, seq_len]
 
@@ -58,7 +58,7 @@ def sample_move(
     del logits, _
 
     # ------------------------------------------------------------------ #
-    #  Step 2: legal move token IDs and their policy scores               #
+    #  Step 2: legal move token IDs and their policy scores              #
     # ------------------------------------------------------------------ #
     legal_token_ids = torch.tensor(
         [tokenizer.encode_move(m) for m in legal_moves],
@@ -69,7 +69,7 @@ def sample_move(
     legal_policy = policy_logits[legal_token_ids]  # [n_legal]
 
     # ------------------------------------------------------------------ #
-    #  Step 3: value scores for each resulting position (when λ > 0)      #
+    #  Step 3: value scores for each resulting position (when λ > 0)     #
     # ------------------------------------------------------------------ #
     if value_weight > 0.0:
         # all sequences are the same length: move_history + one legal move token
@@ -100,7 +100,7 @@ def sample_move(
         final_scores = legal_policy
 
     # ------------------------------------------------------------------ #
-    #  Step 4: sample from the distribution over legal moves              #
+    #  Step 4: sample from the distribution over legal moves             #
     # ------------------------------------------------------------------ #
     probs = F.softmax(final_scores, dim=0)
 
@@ -163,7 +163,7 @@ def sample_move_kv_cache(
         raise ValueError("move_history must contain at least the BOS token")
 
     # ------------------------------------------------------------------ #
-    #  Step 1: process any tokens not yet in the cache                    #
+    #  Step 1: process any tokens not yet in the cache                   #
     # ------------------------------------------------------------------ #
     if cache is None:
         cache = KVCache()
@@ -185,7 +185,7 @@ def sample_move_kv_cache(
             policy_logits = logits[0, 0] / temperature  # [vocab_size]
 
     # ------------------------------------------------------------------ #
-    #  Step 2: legal move token IDs and their policy scores               #
+    #  Step 2: legal move token IDs and their policy scores              #
     # ------------------------------------------------------------------ #
     legal_token_ids = torch.tensor(
         [tokenizer.encode_move(m) for m in legal_moves],
@@ -229,7 +229,7 @@ def sample_move_kv_cache(
         final_scores = legal_policy
 
     # ------------------------------------------------------------------ #
-    #  Step 4: sample from the distribution over legal moves              #
+    #  Step 4: sample from the distribution over legal moves             #
     # ------------------------------------------------------------------ #
     probs = F.softmax(final_scores, dim=0)
 

@@ -12,7 +12,7 @@ from ._tokenizer import ChessTokenizer
 @dataclass
 class GameRecord:
     outcome: float  # 1.0 = white win, 0.0 = black win, 0.5 = draw
-    tensor: torch.Tensor  # int64, [BOS, ..., EOS]
+    tensor: torch.Tensor  # int16 for bank games, int64 for self-play; [BOS, ..., EOS]
     move_weights: torch.Tensor | None = None  # [n_moves + 1], aligned with targets
     value_evals: torch.Tensor | None = (
         None  # [n_moves + 1], aligned with input_ids; tanh-normalized White's perspective
@@ -64,7 +64,10 @@ class ChessDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]
         self, batch: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]]
     ) -> dict[str, torch.Tensor]:
         # batch is a list of (game_tensor, move_weights, value_evals, is_self_play) from __getitem__.
-        tensors: list[torch.Tensor] = [item[0] for item in batch]
+        # Cast to int64 here so bank games (stored as int16) and self-play games (already int64)
+        # always arrive at pad_sequence with a uniform dtype.  This also keeps the cheaper int16
+        # representation in GameRecord until the last possible moment.
+        tensors: list[torch.Tensor] = [item[0].to(torch.long) for item in batch]
         weights: list[torch.Tensor] = [item[1] for item in batch]
         val_evals: list[torch.Tensor] = [item[2] for item in batch]
         is_self_play_flags: list[bool] = [item[3] for item in batch]

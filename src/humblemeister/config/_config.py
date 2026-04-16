@@ -179,7 +179,7 @@ class ChessTrainingConfig:
         result.train_batch_size = 64
         result.self_play_kv_cache = True
         result.streaming = True
-        result.streaming_chunk_size = 2048
+        result.streaming_chunk_size = 3072
         result.self_play_batch_size = 256
         result.n_games = 16384
         return result

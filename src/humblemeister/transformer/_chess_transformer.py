@@ -59,10 +59,6 @@ class ChessTransformer(nn.Module):
 
         self.init_weights()
 
-    @property
-    def output(self) -> nn.Linear:
-        return self.__output
-
     def init_weights(self) -> None:
         for name, p in self.named_parameters():
             if p.dim() > 1:
@@ -104,7 +100,7 @@ class ChessTransformer(nn.Module):
             out, _ = block(out, mask, kv_cache=None, is_causal=is_causal)
 
         hidden = self.__norm(out)
-        logits = self.output(hidden)  # [batch, seq, vocab_size]
+        logits = self.__output(hidden)  # [batch, seq, vocab_size]
         value = self.__value_head(hidden).squeeze(-1)  # [batch, seq]
         return logits, value
 
@@ -135,6 +131,6 @@ class ChessTransformer(nn.Module):
             new_layers.append(new_layer_cache)
 
         hidden = self.__norm(out)
-        logits = self.output(hidden)
+        logits = self.__output(hidden)
         value = self.__value_head(hidden).squeeze(-1)  # [batch, 1]
         return logits, value, KVCache(layers=new_layers)
