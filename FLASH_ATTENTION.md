@@ -183,21 +183,23 @@ contamination signal is likely below the noise floor of training. Ship
 the flag, measure train/val loss against the old PADDED_MASK path for
 a few hundred steps, and if the curves match, you're done.
 
-This is the recommended first step.
+### 1. Length bucketing in the DataLoader — **enabled by default**
 
-### 1. Length bucketing in the DataLoader
+Group games of identical length into the same batch so padding drops
+to **zero**. Implemented by `LengthBucketBatchSampler`
+(`src/humblemeister/data/_bucket_sampler.py`) and enabled via
+`config.batch_length_sampling = BatchLengthSampling.BUCKETED`, which
+is the default whenever `training_self_attention = FLASH`. The full
+design — per-epoch uniform sampling, single-length batches, tail
+batches, `(seed, epoch)` determinism — is documented in the "Batch
+Assembly (Length Bucketing)" section of
+[MODEL.md](MODEL.md#batch-assembly-length-bucketing).
 
-Sort games by length and group games of similar length into the same
-batch. A `BatchSampler` that yields length-bucketed batches reduces
-per-batch padding from ~30-50% (random batches) to typically <5%.
-
-Concretely: add a sampler that partitions indices into bins by
-`len(game.tensor)` and yields batches drawn from a single bin at a
-time. The LR curve sees the same number of steps; only the padding
-fraction changes.
-
-This is the single biggest quality lever. Recommended whenever you
-see padding fraction >10%.
+Because every batch is single-length, there's nothing to attend *to*
+that isn't a real token — this eliminates mitigation (0)'s
+"contamination" entirely in the common case. Set
+`batch_length_sampling = RANDOM` to fall back to shuffled batches for
+parity testing.
 
 ### 2. Hard-zero PAD contribution via `padding_idx` — **enabled by default**
 
@@ -223,8 +225,8 @@ Caveats (it's a nudge, not a guarantee):
   In practice the magnitude is still small enough that real-token
   outputs are only mildly perturbed.
 
-For full correctness, combine with (1) length bucketing. If your
-padding fraction is already <5%, (2) alone is enough.
+For full correctness, combine with (1) length bucketing — which the
+default config already does.
 
 ### 3. Boolean mask instead of float additive
 
@@ -273,11 +275,10 @@ packed batches with no padding. This is (4) productised.
 
 | Scenario                                   | Recommended mitigation |
 |--------------------------------------------|------------------------|
-| Just flipped the flag, want to verify      | (0) — measure loss parity |
-| Padding fraction >10% observed             | (1) length bucketing |
-| Want zero contamination, happy with ~70% of Flash speed | (3) bool mask |
+| Default config                             | (1) length bucketing + (2) `padding_idx` — **both on by default** |
+| Verifying loss parity after a change       | (0) — measure against PADDED_MASK |
+| Want zero contamination with bool mask semantics | (3) bool mask |
 | Chasing maximum throughput on huge configs | (4) packing with position reset |
-| Padding fraction very low already          | (0) — do nothing |
 
 ## How to fall back
 

@@ -851,30 +851,18 @@ class ChessTrainer:
         for epoch in tqdm(range(start_epoch, end_epoch)):
             epoch_start = time.perf_counter()
 
-            cycle = 10
-            attempt = 1
-            while True:
-                if self.__config.streaming:
-                    ratio = self._self_play_ratio(epoch)
-                    n_sp = int(self.__config.n_games * ratio)
-                    n_bank = self.__config.n_games - n_sp
-                    loss, value_loss, stepped = self.__run_epoch_streaming(
-                        epoch, n_bank, n_sp, ratio
-                    )
-                else:
-                    ratio = self.generate_games(epoch)
-                    loss, value_loss, stepped = self.train_on_games(epoch, ratio)
-                if stepped:
-                    self_play_ratio = ratio
-                    attempt = 1
-                    break
-                print(f"failed to step {attempt} / {cycle} , retrying")
-                if attempt % cycle == 0:
-                    print("reinitializing weights")
-                    self.__model.init_weights()
-                    attempt = 1
-                else:
-                    attempt += 1
+            if self.__config.streaming:
+                ratio = self._self_play_ratio(epoch)
+                n_sp = int(self.__config.n_games * ratio)
+                n_bank = self.__config.n_games - n_sp
+                loss, value_loss, stepped = self.__run_epoch_streaming(
+                    epoch, n_bank, n_sp, ratio
+                )
+            else:
+                ratio = self.generate_games(epoch)
+                loss, value_loss, stepped = self.train_on_games(epoch, ratio)
+            if not stepped:
+                raise RuntimeError('The trainer has failed to make a step.')
 
             self.__scheduler.step()
 

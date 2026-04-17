@@ -31,6 +31,18 @@ The vocabulary contains:
 
 All possible moves are enumerated at construction time by iterating over every pair of squares on the board, filtering out same-square moves, and adding promotion variants for pawn moves that reach the back rank (with 4 promotion pieces: queen, rook, bishop, knight). This produces a vocabulary of approximately **3,000 tokens**.
 
+### Versioning & `vocab_hash`
+
+`ChessTokenizer.VERSION` is bumped whenever the tokenizer output semantics
+change (not for pure code refactors). `ChessTokenizer.vocab_hash()` returns a
+short SHA-256 of the sorted `(uci, id)` pairs — a stable fingerprint of the
+current vocabulary.
+
+The hash is stamped into every shard written by `ChessGameBank.save()` and
+checked on `load()`. Shards whose hash doesn't match the current tokenizer
+are rejected; shards written before the stamp existed are accepted with a
+warning so older corpora can still be used.
+
 ### Legal Move Masking
 
 During inference, illegal moves are masked out before sampling. `get_legal_mask` returns an additive logit mask of shape `[vocab_size]`:
@@ -136,7 +148,7 @@ This **weight tying** means the same matrix is used to both embed tokens into `d
 
 ### Value Head
 
-A small 4-layer MLP sitting on top of the transformer's final hidden states:
+A small 2-layer MLP (Linear → GELU → Linear → Tanh) sitting on top of the transformer's final hidden states:
 
 ```
 hidden [batch, seq, d_model]
@@ -213,6 +225,16 @@ build a game bank from raw archives. It:
 
 This is how the 7M-game ELO 2200+ corpus is prepared for the 688M model.
 
+#### `fill_value_evals()` — backfill for legacy shards
+
+Early shards were produced before the value head existed and therefore have
+no `value_evals` field. `ChessGameBank.fill_value_evals(path, n_workers)`
+iterates those shards, runs Stockfish on any games with missing evals, and
+rewrites the shard in place. Games that already have evals are skipped.
+After the backfill the in-memory bank is reloaded from disk. This avoids
+re-running the full `convert_games` pipeline when only the value signal is
+missing.
+
 #### Move Weights
 
 For each game, all `N+1` board positions (before + after each move) are evaluated. Per-move advantage is computed as:
@@ -255,6 +277,11 @@ targets      = [     m1, m2, ..., mN, EOS]  ← prediction targets
 ```
 
 Move weights and value evaluations are aligned with `input_ids` and padded with zeros. A `has_value_evals` boolean mask per game tracks which games have real Stockfish evaluations vs. zero fallback, to correctly gate the value loss.
+
+Bank games longer than `config.max_moves` (default 500) are skipped during
+epoch assembly in `__generate_from_bank`. This caps sequence length for the
+positional encoding (`max_seq_len = 512`) and trims the long tail of
+extreme games.
 
 ---
 
@@ -452,7 +479,7 @@ There is no resume-from-run(): `run()` is deliberately one-shot.
 Before self-play begins, the value head is pretrained independently:
 
 1. Freeze all transformer parameters
-2. Train only the value head parameters (`~1.18M` for giant) with AdamW `lr=3e-4`
+2. Train only the value head parameters (`~1.18M` for giant) with AdamW `lr=1e-3` (default, overridable)
 3. Each epoch loads `n_games` from the bank, runs the full frozen forward pass, computes MSE loss against `value_evals`
 4. Restore all parameters to trainable
 5. Save checkpoint
@@ -516,7 +543,39 @@ Self-play-only chunk generation additionally respects
 during generation, so the model tends to pick moves that *it* rates as
 leading to good positions.
 
+#### Heap fragmentation mitigation
+
+The per-epoch alloc/free churn (generate games → build dataset → discard)
+causes glibc's `malloc` to accumulate unreturned arenas: RSS grows
+monotonically even though Python objects are being freed. Every 50
+epochs the trainer runs:
+
+```python
+gc.collect()
+ctypes.CDLL("libc.so.6").malloc_trim(0)
+```
+
+`malloc_trim(0)` asks glibc to return freed-but-cached pages to the OS.
+Without this, multi-day training runs drift into swap on memory-tight
+hosts. The call is wrapped in a `try/except` so non-Linux / non-glibc
+environments silently skip it.
+
 ### Self-Play Generation
+
+Two backends are available:
+
+- **`SelfPlayGPU`** (default, used by the giant config) — batched GPU
+  generation with a single shared model. Games run in lockstep inside a
+  GPU batch, with per-game KV caches and finished games dropped from the
+  batch by row.
+- **`SelfPlayCPU`** — multi-process CPU generation. Workers fork from a
+  saved checkpoint, each loads its own `ChessModel` on CPU, and plays its
+  share of games via `ChessGame`. Useful when the GPU is saturated by
+  training or when scaling CPU cores is easier than VRAM.
+
+Both share the same Stockfish post-processing path (`AsyncBatchEvaluator`)
+for move-weight computation and, where applicable, outcome determination
+at `max_moves`.
 
 Games are generated in batches (`self_play_batch_size`). The batch size on the last batch is capped to exactly the number of games still needed, so self-play never overshoots the configured ratio.
 
@@ -613,7 +672,19 @@ A breakthrough is triggered when `recent_mean < old_mean - 3 × old_MQD` — i.e
 
 **File:** `src/humblemeister/_engine.py`
 
-`ChessEngine` wraps the model for interactive play. It dispatches to one of two sampling paths depending on the `use_kv_cache` constructor flag.
+Inference is split into two classes so that a single set of weights can serve
+many concurrent games (e.g. the Gradio app running N parallel sessions):
+
+- **`ChessModel`** — holds the `ChessTransformer` weights, the `ChessTokenizer`
+  and the device. It exposes a single `sample(...)` method that runs one
+  inference step. One `ChessModel` per model artifact, shared across all games.
+- **`ChessGame`** — one per game. Owns the `chess.Board`, the move-history
+  token list, the player colour, a per-game `KVCache`, and the sampling
+  hyperparameters (`temperature`, `value_weight`, `use_kv_cache`). Delegates
+  the actual forward pass to the shared `ChessModel`.
+
+`ChessGame.sample_move()` dispatches to one of two sampling paths depending on
+the constructor flag `use_kv_cache`:
 
 #### Without KV cache (`use_kv_cache=False`, default)
 
@@ -627,7 +698,9 @@ Calls `sample_move`, which runs a full forward pass over the complete move histo
 
 #### With KV cache (`use_kv_cache=True`)
 
-Calls `sample_move_kv_cache` with a persistent `KVCache` stored on the engine. The cache is initialised on `start_game()` / `reset()` and accumulates across moves:
+Calls `sample_move_kv_cache` with a persistent `KVCache` stored on the
+`ChessGame`. The cache is initialised on `start_game()` / `reset()` and
+accumulates across moves:
 
 - Only tokens added since the previous call are processed — O(1) per turn once warmed up
 - The cache is reset at the start of each new game
@@ -644,7 +717,9 @@ The value scores are obtained in a single batched `generate_step` over all legal
 
 Temperature controls play style: `< 1.0` makes play more deterministic, `> 1.0` makes play more random.
 
-Models are loaded from safetensors directories (the format produced by `save_model`). The `load()` class method auto-detects whether a path is a safetensors directory or a `.pt` checkpoint.
+Models are loaded via `ChessModel.load(path, device)`, which auto-detects
+whether `path` is a safetensors directory (produced by `save_model`) or a
+`.pt` checkpoint.
 
 ---
 
@@ -657,9 +732,10 @@ Models are loaded from safetensors directories (the format produced by `save_mod
 | `n_layers` | 24 | Transformer blocks |
 | `d_ff` | 6144 | Feed-forward inner dim |
 | `max_seq_len` | 512 | Max game length in tokens |
-| `dropout` | 0.05 | Dropout rate |
-| `train_batch_size` | 4 | Games per gradient step |
-| `n_games` | 4096 | Games loaded per epoch |
+| `dropout` | 0.1 | Dropout rate |
+| `train_batch_size` | 64 | Games per gradient step |
+| `n_games` | 16384 | Games loaded per epoch |
+| `max_moves` | 500 | Bank games longer than this are skipped during epoch assembly |
 | `lr` | 3e-4 | Peak learning rate |
 | `warmup_epochs` | 50 | LR warmup duration |
 | `label_smoothing` | 0.1 | Cross-entropy smoothing |
@@ -668,12 +744,13 @@ Models are loaded from safetensors directories (the format produced by `save_mod
 | `value_loss_weight` | 0.5 | Value vs policy loss ratio |
 | `self_play_start_epoch` | 1000 | When self-play begins |
 | `self_play_max_ratio` | 0.30 | Max self-play fraction |
+| `self_play_batch_size` | 256 | Games generated in parallel per SelfPlayGPU batch |
 | `self_play_loss_mode` | `advantage_weighted` | See [SELF_PLAY_LOSS.md](SELF_PLAY_LOSS.md) |
 | `self_play_value_weight` | 0.5 | Blend value head into move selection during self-play generation |
 | `self_play_max_moves` | 84 | Hard draw cap for self-play games |
 | `self_play_kv_cache` | True | Use KV cache during self-play generation |
 | `streaming` | True | Chunked epoch, one optimizer step per epoch |
-| `streaming_chunk_size` | 512 | Games per streaming chunk |
+| `streaming_chunk_size` | 3072 | Games per streaming chunk |
 | `bf16` | True | bfloat16 mixed precision |
 | `stockfish_depth` | 5 | Stockfish search depth |
 | `stockfish_workers` | 24 | Parallel Stockfish processes |
