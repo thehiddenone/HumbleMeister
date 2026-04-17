@@ -1,5 +1,6 @@
-from ._engine import ChessEngine
+from ._engine import ChessGame, ChessModel
 
 __all__ = [
-    "ChessEngine",
+    "ChessModel",
+    "ChessGame",
 ]

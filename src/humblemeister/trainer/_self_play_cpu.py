@@ -16,7 +16,7 @@ from humblemeister.data import ChessTokenizer, GameRecord
 from humblemeister.evaluation import AsyncBatchEvaluator
 from humblemeister.transformer import ChessTransformer
 
-from .._engine import ChessEngine
+from .._engine import ChessGame, ChessModel
 
 # ------------------------------------------------------------------ #
 #  Module-level worker helpers (must be at module level for "spawn")  #
@@ -87,12 +87,9 @@ def _worker_fn(
     import time
 
     log_path = output_path.replace(".pt", ".log")
-    engine = ChessEngine.load(
-        model_path,
-        device="cpu",
-        temperature=temperature,
-        value_weight=value_weight,
-        use_kv_cache=use_kv_cache,
+    chess_model = ChessModel.load(model_path, device="cpu")
+    engine = ChessGame(
+        chess_model, temperature=temperature, value_weight=value_weight, use_kv_cache=use_kv_cache
     )
 
     games: list[dict[str, Any]] = []
@@ -150,7 +147,7 @@ class SelfPlayCPU:
     --------
     1. Save the current model weights to a temp file (cleaned up automatically).
     2. Spawn up to n_workers child processes; each loads the model on CPU via
-       ChessEngine.load() and plays its share of games.
+       ChessModel.load() and plays its share of games via ChessGame.
     3. At max_moves, Stockfish evaluates the final position to decide the outcome
        instead of calling it a draw unconditionally.
     4. Collect all game dicts, send them as a single batch to AsyncBatchEvaluator
@@ -177,9 +174,9 @@ class SelfPlayCPU:
             n_workers:             maximum number of parallel child processes for generation.
             max_moves:             hard cap on game length (half-moves / plies); when reached
                                    Stockfish evaluates the position to determine the winner.
-            temperature:           ChessEngine move-sampling temperature.
-            value_weight:          ChessEngine value-head blend weight (0 = pure policy).
-            use_kv_cache:          whether ChessEngine uses KV caching during generation.
+            temperature:           move-sampling temperature passed to ChessGame.
+            value_weight:          value-head blend weight passed to ChessGame (0 = pure policy).
+            use_kv_cache:          whether ChessGame uses KV caching during generation.
             stockfish_path:        path to the Stockfish binary.
             stockfish_depth:       Stockfish search depth used for both outcome determination
                                    and move-weight computation.

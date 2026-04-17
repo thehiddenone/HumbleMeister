@@ -14,66 +14,81 @@ from .inference import sample_move, sample_move_kv_cache
 from .transformer import ChessTransformer
 
 
-class ChessEngine:
+class ChessModel:
+    """
+    Holds the transformer weights, tokenizer and device.
+
+    A single ChessModel can be shared across many ChessGame instances — only
+    one copy of the weights lives in memory regardless of how many concurrent
+    games are running.
+    """
+
     __model: ChessTransformer
     __tokenizer: ChessTokenizer
     __device: torch.device
-    __temperature: float
-    __value_weight: float
-    __use_kv_cache: bool
-    __player_color: chess.Color | None
-    __board: chess.Board
-    __move_history: list[int]
-    __kv_cache: KVCache
-    __kv_cache_tokens: int
 
     def __init__(
         self,
         model: ChessTransformer,
         tokenizer: ChessTokenizer,
         device: str = "cpu",
-        temperature: float = 1.0,
-        value_weight: float = 1.0,
-        use_kv_cache: bool = True,
     ) -> None:
-        """
-        Args:
-            model:        trained ChessTransformer; will be moved to device.
-            tokenizer:    tokenizer matching the model's vocabulary.
-            device:       torch device string — "cpu", "cuda", "cuda:0", etc.
-            temperature:  softmax temperature for move sampling; <1 = sharper, >1 = more random.
-            value_weight: blend policy logits with value head output.
-                          0.0 = pure policy; higher values shift selection toward value-guided moves.
-            use_kv_cache: reuse K/V from previous moves each turn; faster per-step but holds the
-                          cache in memory for the duration of the game.
-        """
         self.__model = model.to(device)
         self.__tokenizer = tokenizer
         self.__device = torch.device(device)
-        self.__temperature = temperature
-        self.__value_weight = value_weight
-        self.__use_kv_cache = use_kv_cache
-        self.__player_color = None
-        self.__board = chess.Board()
-        self.__move_history = [self.__tokenizer.BOS]
-        self.__kv_cache = KVCache()
-        self.__kv_cache_tokens = 0
-
         self.__model.eval()
 
-    # ------------------------------------------------------------------ #
-    #  Loading                                                             #
-    # ------------------------------------------------------------------ #
+    @property
+    def tokenizer(self) -> ChessTokenizer:
+        return self.__tokenizer
+
+    @property
+    def device(self) -> torch.device:
+        return self.__device
+
+    def sample(
+        self,
+        board: chess.Board,
+        move_history: list[int],
+        temperature: float,
+        value_weight: float,
+        use_kv_cache: bool,
+        kv_cache: KVCache,
+        kv_cache_tokens: int,
+    ) -> tuple[chess.Move, KVCache]:
+        """
+        Sample one move given the current game state.
+
+        Returns (move, updated_kv_cache).  When use_kv_cache is False the
+        returned cache is an empty KVCache (the caller should discard it).
+        """
+        if use_kv_cache:
+            move, new_cache = sample_move_kv_cache(
+                model=self.__model,
+                tokenizer=self.__tokenizer,
+                board=board,
+                move_history=move_history,
+                device=self.__device,
+                temperature=temperature,
+                value_weight=value_weight,
+                cache=kv_cache,
+                cache_tokens=kv_cache_tokens,
+            )
+            return move, new_cache
+
+        move = sample_move(
+            model=self.__model,
+            tokenizer=self.__tokenizer,
+            board=board,
+            move_history=move_history,
+            device=self.__device,
+            temperature=temperature,
+            value_weight=value_weight,
+        )
+        return move, KVCache()
 
     @classmethod
-    def from_safetensors(
-        cls,
-        path: str,
-        device: str = "cpu",
-        temperature: float = 1.0,
-        value_weight: float = 0.0,
-        use_kv_cache: bool = False,
-    ) -> ChessEngine:
+    def from_safetensors(cls, path: str, device: str = "cpu") -> ChessModel:
         from safetensors.torch import load_file
 
         with open(f"{path}/config.json") as f:
@@ -96,17 +111,10 @@ class ChessEngine:
                 f"missing: {unexpected_missing}, unexpected: {incompatible.unexpected_keys}"
             )
 
-        return cls(model, tokenizer, device, temperature, value_weight, use_kv_cache)
+        return cls(model, tokenizer, device)
 
     @classmethod
-    def from_pt(
-        cls,
-        path: str,
-        device: str = "cpu",
-        temperature: float = 1.0,
-        value_weight: float = 0.0,
-        use_kv_cache: bool = False,
-    ) -> ChessEngine:
+    def from_pt(cls, path: str, device: str = "cpu") -> ChessModel:
         checkpoint = torch.load(path, map_location=device, weights_only=True)
         config_data = checkpoint["config"]
         config = (
@@ -115,26 +123,18 @@ class ChessEngine:
         tokenizer = ChessTokenizer()
         model = cls._build_model(config, tokenizer)
         model.load_state_dict(checkpoint["model_state"])
-
-        return cls(model, tokenizer, device, temperature, value_weight, use_kv_cache)
+        return cls(model, tokenizer, device)
 
     @classmethod
-    def load(
-        cls,
-        path: str,
-        device: str = "cpu",
-        temperature: float = 1.0,
-        value_weight: float = 0.0,
-        use_kv_cache: bool = False,
-    ) -> ChessEngine:
-        """Load from either a safetensors directory or a .pt file."""
+    def load(cls, path: str, device: str = "cpu") -> ChessModel:
+        """Load from a safetensors directory or a .pt checkpoint file."""
         p = Path(path)
         if p.is_dir() and (p / "model.safetensors").exists():
-            return cls.from_safetensors(path, device, temperature, value_weight, use_kv_cache)
+            return cls.from_safetensors(path, device)
         elif p.suffix == ".pt":
-            return cls.from_pt(path, device, temperature, value_weight, use_kv_cache)
+            return cls.from_pt(path, device)
         else:
-            raise ValueError(f"could not find a valid model at {path}")
+            raise ValueError(f"could not find a valid model at {path!r}")
 
     @staticmethod
     def _build_model(config: ChessTrainingConfig, tokenizer: ChessTokenizer) -> ChessTransformer:
@@ -149,9 +149,51 @@ class ChessEngine:
             pad_id=tokenizer.PAD,
         )
 
-    # ------------------------------------------------------------------ #
-    #  Properties                                                          #
-    # ------------------------------------------------------------------ #
+
+class ChessGame:
+    """
+    Per-game state for one chess game against (or alongside) a ChessModel.
+
+    Multiple ChessGame instances can share a single ChessModel, so only one
+    copy of the model weights lives in memory regardless of concurrent game
+    count.
+    """
+
+    __chess_model: ChessModel
+    __temperature: float
+    __value_weight: float
+    __use_kv_cache: bool
+    __player_color: chess.Color | None
+    __board: chess.Board
+    __move_history: list[int]
+    __kv_cache: KVCache
+    __kv_cache_tokens: int
+
+    def __init__(
+        self,
+        chess_model: ChessModel,
+        temperature: float = 1.0,
+        value_weight: float = 0.0,
+        use_kv_cache: bool = False,
+    ) -> None:
+        """
+        Args:
+            chess_model:  shared ChessModel instance (weights + tokenizer + device).
+            temperature:  softmax temperature for move sampling; <1 = sharper, >1 = more random.
+            value_weight: blend policy logits with value head output.
+                          0.0 = pure policy; higher values shift selection toward value-guided moves.
+            use_kv_cache: reuse K/V from previous moves each turn; faster per-step but holds the
+                          cache in memory for the duration of the game.
+        """
+        self.__chess_model = chess_model
+        self.__temperature = temperature
+        self.__value_weight = value_weight
+        self.__use_kv_cache = use_kv_cache
+        self.__player_color = None
+        self.__board = chess.Board()
+        self.__move_history = [chess_model.tokenizer.BOS]
+        self.__kv_cache = KVCache()
+        self.__kv_cache_tokens = 0
 
     @property
     def player_color(self) -> chess.Color | None:
@@ -161,44 +203,26 @@ class ChessEngine:
     def board(self) -> chess.Board:
         return self.__board
 
-    # ------------------------------------------------------------------ #
-    #  Inference                                                           #
-    # ------------------------------------------------------------------ #
-
-    def __reset_kv_cache(self) -> None:
-        self.__kv_cache = KVCache()
-        self.__kv_cache_tokens = 0
-
     def sample_move(self) -> chess.Move:
-        if self.__use_kv_cache:
-            move, self.__kv_cache = sample_move_kv_cache(
-                model=self.__model,
-                tokenizer=self.__tokenizer,
-                board=self.__board,
-                move_history=self.__move_history,
-                device=self.__device,
-                temperature=self.__temperature,
-                value_weight=self.__value_weight,
-                cache=self.__kv_cache,
-                cache_tokens=self.__kv_cache_tokens,
-            )
-            self.__kv_cache_tokens = len(self.__move_history)
-            return move
-        return sample_move(
-            model=self.__model,
-            tokenizer=self.__tokenizer,
+        move, new_cache = self.__chess_model.sample(
             board=self.__board,
             move_history=self.__move_history,
-            device=self.__device,
             temperature=self.__temperature,
             value_weight=self.__value_weight,
+            use_kv_cache=self.__use_kv_cache,
+            kv_cache=self.__kv_cache,
+            kv_cache_tokens=self.__kv_cache_tokens,
         )
+        if self.__use_kv_cache:
+            self.__kv_cache = new_cache
+            self.__kv_cache_tokens = len(self.__move_history)
+        return move
 
     def apply_move(self, move: chess.Move) -> None:
         if move not in self.__board.legal_moves:
             raise ValueError(f"{move.uci()} is not a legal move in the current position")
         self.__board.push(move)
-        self.__move_history.append(self.__tokenizer.encode_move(move))
+        self.__move_history.append(self.__chess_model.tokenizer.encode_move(move))
 
     def move(
         self, player_move: chess.Move | str | None = None
@@ -208,11 +232,12 @@ class ChessEngine:
 
         Args:
             player_move: the move you want to play, as a chess.Move or UCI string
-                         e.g. chess.Move.from_uci("e2e4") or just "e2e4"
-                         if None, the model plays both sides (self-play)
+                         e.g. chess.Move.from_uci("e2e4") or just "e2e4".
+                         If None, the model plays both sides (self-play).
 
         Returns:
-            the current chess.Board — renderable in Jupyter via chess.svg
+            (board, model_move) — model_move is None when the game is over or
+            when the player just moved into a game-over state.
         """
         if self.__board.is_game_over():
             print(f"game over — {self.__board.result()}")
@@ -249,8 +274,9 @@ class ChessEngine:
         If the player is black, the model immediately plays white's first move."""
         self.__player_color = player_color
         self.__board = chess.Board()
-        self.__move_history = [self.__tokenizer.BOS]
-        self.__reset_kv_cache()
+        self.__move_history = [self.__chess_model.tokenizer.BOS]
+        self.__kv_cache = KVCache()
+        self.__kv_cache_tokens = 0
 
         if player_color == chess.BLACK:
             model_move = self.sample_move()
@@ -262,8 +288,9 @@ class ChessEngine:
     def reset(self) -> chess.Board:
         """Reset the board, keeping the current player color."""
         self.__board = chess.Board()
-        self.__move_history = [self.__tokenizer.BOS]
-        self.__reset_kv_cache()
+        self.__move_history = [self.__chess_model.tokenizer.BOS]
+        self.__kv_cache = KVCache()
+        self.__kv_cache_tokens = 0
         return self.__board
 
     def render(self) -> chess.svg.SvgWrapper:
@@ -277,7 +304,7 @@ class ChessEngine:
 
     def __repr__(self) -> str:
         return (
-            f"ChessEngine(\n"
+            f"ChessGame(\n"
             f"  turn={('white' if self.__board.turn == chess.WHITE else 'black')}\n"
             f"  moves={self.__board.fullmove_number}\n"
             f"  result={self.__board.result() if self.__board.is_game_over() else 'ongoing'}\n"
