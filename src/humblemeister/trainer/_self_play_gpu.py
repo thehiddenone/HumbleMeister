@@ -12,6 +12,7 @@ from humblemeister.attention import KVCache, LayerKVCache
 from humblemeister.config import ChessTrainingConfig
 from humblemeister.data import ChessTokenizer, GameRecord
 from humblemeister.evaluation import AsyncBatchEvaluator
+from humblemeister.inference import pick_move_selfplay
 from humblemeister.transformer import ChessTransformer
 
 from ._self_play_cpu import _stockfish_outcome
@@ -36,9 +37,10 @@ class SelfPlayGPU:
     Policy path: one batched `generate_step` call per move step across all
     active games — O(1) activations per token, O(seq) cache growth.
 
-    Value path (value_weight > 0): one batched full-recompute forward pass per
-    active game per step over its legal moves.  Uses `is_causal=True` (Flash
-    Attention) so peak memory is one layer's activations at a time.
+    Value path: one batched full-recompute forward pass per active game per
+    step over its legal moves, feeding the blunder-gap mask. Uses
+    `is_causal=True` (Flash Attention) so peak memory is one layer's
+    activations at a time.
     """
 
     def __init__(
@@ -46,7 +48,7 @@ class SelfPlayGPU:
         batch_size: int = 1,
         max_moves: int = 120,
         temperature: float = 1.0,
-        value_weight: float = 0.0,
+        blunder_threshold: float = 0.25,
         stockfish_path: str = "stockfish",
         stockfish_depth: int = 5,
         stockfish_workers: int = 24,
@@ -61,9 +63,9 @@ class SelfPlayGPU:
             max_moves:             hard cap on game length (half-moves); Stockfish evaluates
                                    the final position when the cap is reached.
             temperature:           softmax temperature for policy sampling.
-            value_weight:          blend weight for the value head (0 = pure policy).
-                                   Values > 0 add a batched full-recompute forward pass per
-                                   active game per step — higher VRAM and compute cost.
+            blunder_threshold:     max allowed value-head gap from the best candidate, in tanh-value
+                                   units (0.25 ≈ 100 cp). Candidate moves beyond this gap are
+                                   excluded before sampling the policy.
             stockfish_path:        path to the Stockfish binary.
             stockfish_depth:       Stockfish search depth for outcome and move-weight eval.
             stockfish_workers:     worker pool size for AsyncBatchEvaluator.
@@ -72,17 +74,17 @@ class SelfPlayGPU:
             draw_score_hi:         White win-probability above this → White wins (default 0.6).
             bf16:                  use bfloat16 autocast on CUDA devices.
         """
-        self._batch_size = batch_size
-        self._max_moves = max_moves
-        self._temperature = temperature
-        self._value_weight = value_weight
-        self._stockfish_path = stockfish_path
-        self._stockfish_depth = stockfish_depth
-        self._stockfish_workers = stockfish_workers
-        self._advantage_temperature = advantage_temperature
-        self._draw_lo = draw_score_lo
-        self._draw_hi = draw_score_hi
-        self._bf16 = bf16
+        self.__batch_size = batch_size
+        self.__max_moves = max_moves
+        self.__temperature = temperature
+        self.__blunder_threshold = blunder_threshold
+        self.__stockfish_path = stockfish_path
+        self.__stockfish_depth = stockfish_depth
+        self.__stockfish_workers = stockfish_workers
+        self.__advantage_temperature = advantage_temperature
+        self.__draw_lo = draw_score_lo
+        self.__draw_hi = draw_score_hi
+        self.__bf16 = bf16
 
     def _play_game(
         self,
@@ -98,7 +100,7 @@ class SelfPlayGPU:
         row is removed so the cache never grows beyond the active count.
         Returns a list of dicts (one per game) with keys 'moves', 'outcome', 'weights'.
         """
-        use_autocast = self._bf16 and device.type == "cuda"
+        use_autocast = self.__bf16 and device.type == "cuda"
 
         boards: list[chess.Board] = [chess.Board() for _ in range(batch_size)]
         histories: list[list[int]] = [[tokenizer.BOS] for _ in range(batch_size)]
@@ -126,13 +128,13 @@ class SelfPlayGPU:
                 if board.is_game_over():
                     result = board.result()
                     outcome = {"1-0": 1.0, "0-1": 0.0, "1/2-1/2": 0.5}.get(result, 0.5)
-                elif len(board.move_stack) >= self._max_moves:
+                elif len(board.move_stack) >= self.__max_moves:
                     outcome = _stockfish_outcome(
                         board,
-                        self._stockfish_path,
-                        self._stockfish_depth,
-                        self._draw_lo,
-                        self._draw_hi,
+                        self.__stockfish_path,
+                        self.__stockfish_depth,
+                        self.__draw_lo,
+                        self.__draw_hi,
                     )
                 else:
                     still_active.append(i)
@@ -158,7 +160,7 @@ class SelfPlayGPU:
             n_active = len(boards)
 
             # ------------------------------------------------------------------ #
-            #  Sample one move per active game                                    #
+            #  Sample one move per active game                                   #
             # ------------------------------------------------------------------ #
             chosen_ids = torch.empty(n_active, dtype=torch.long, device=device)
 
@@ -170,37 +172,34 @@ class SelfPlayGPU:
                     device=device,
                 )  # [n_legal]
 
-                legal_policy = policy_logits[i][legal_tids] / self._temperature
+                legal_policy = policy_logits[i][legal_tids] / self.__temperature
 
-                if self._value_weight > 0.0:
-                    # Batched full recompute over all resulting positions for this game.
-                    # Peak memory: one layer of [n_legal, seq_len+1, d_model] at a time.
-                    value_input = torch.tensor(
-                        [history + [int(tid.item())] for tid in legal_tids],
-                        dtype=torch.long,
-                        device=device,
-                    )  # [n_legal, seq_len+1]
-                    with torch.no_grad():
-                        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_autocast):
-                            _, value_preds = model(value_input, is_causal=True)
-                    value_scores = value_preds[:, -1].clone()  # [n_legal]
-                    if board.turn == chess.BLACK:
-                        value_scores = -value_scores
-                    del value_input, value_preds
-                    final_scores = legal_policy + self._value_weight * value_scores
-                else:
-                    final_scores = legal_policy
+                # Batched full recompute over all resulting positions for this game.
+                # Peak memory: one layer of [n_legal, seq_len+1, d_model] at a time.
+                value_input = torch.tensor(
+                    [history + [int(tid.item())] for tid in legal_tids],
+                    dtype=torch.long,
+                    device=device,
+                )  # [n_legal, seq_len+1]
+                with torch.no_grad():
+                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_autocast):
+                        _, value_preds = model(value_input, is_causal=True)
+                value_scores = value_preds[:, -1].clone()  # [n_legal]
+                if board.turn == chess.BLACK:
+                    value_scores = -value_scores
+                del value_input, value_preds
 
-                probs = F.softmax(final_scores, dim=0)
-                if torch.isnan(probs).any() or torch.isinf(probs).any():
-                    pick = int(torch.randint(len(legal_moves), (1,)).item())
-                else:
-                    pick = int(torch.multinomial(probs, num_samples=1).item())
+                # ------------------------------------------------------------------ #
+                #  Mask blunders and sample (self-play = stochastic)                 #
+                # ------------------------------------------------------------------ #
+                pick_idx, _ = pick_move_selfplay(
+                    board, legal_moves, legal_policy, value_scores, self.__blunder_threshold
+                )
 
-                chosen_ids[i] = legal_tids[pick]
-                board.push(legal_moves[pick])
-                history.append(int(legal_tids[pick].item()))
-                del legal_tids, legal_policy, final_scores, probs
+                chosen_ids[i] = legal_tids[pick_idx]
+                board.push(legal_moves[pick_idx])
+                history.append(int(legal_tids[pick_idx].item()))
+                del legal_tids, legal_policy
 
             # ------------------------------------------------------------------ #
             #  Advance the stacked KV cache with all chosen tokens               #
@@ -246,8 +245,8 @@ class SelfPlayGPU:
 
         raw_games: list[dict[str, Any]] = []
         try:
-            for batch_start in range(0, n_games, self._batch_size):
-                batch_n = min(self._batch_size, n_games - batch_start)
+            for batch_start in range(0, n_games, self.__batch_size):
+                batch_n = min(self.__batch_size, n_games - batch_start)
                 raw_games.extend(self._play_game(model, tokenizer, device, batch_n))
         finally:
             if was_training:
@@ -263,11 +262,11 @@ class SelfPlayGPU:
             batch_path = Path(tmpdir) / "batch.pt"
             torch.save(raw_games, batch_path)
 
-            n_sf_workers = min(self._stockfish_workers, len(raw_games))
+            n_sf_workers = min(self.__stockfish_workers, len(raw_games))
             with AsyncBatchEvaluator(
-                stockfish_path=self._stockfish_path,
-                depth=self._stockfish_depth,
-                temperature=self._advantage_temperature,
+                stockfish_path=self.__stockfish_path,
+                depth=self.__stockfish_depth,
+                temperature=self.__advantage_temperature,
                 n_workers=n_sf_workers,
             ) as evaluator:
                 evaluator.submit(batch_path)

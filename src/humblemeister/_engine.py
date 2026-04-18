@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -12,6 +13,17 @@ from .config import ChessTrainingConfig
 from .data import ChessTokenizer
 from .inference import sample_move, sample_move_kv_cache
 from .transformer import ChessTransformer
+
+
+def _config_from_dict(raw: dict) -> ChessTrainingConfig:
+    """Build a ChessTrainingConfig from a possibly-stale dict.
+
+    Older checkpoints may carry fields that have since been removed from the
+    config (e.g. `self_play_value_weight`). Silently drop any unknown keys so
+    older artifacts still load.
+    """
+    valid = {f.name for f in dataclasses.fields(ChessTrainingConfig)}
+    return ChessTrainingConfig(**{k: v for k, v in raw.items() if k in valid})
 
 
 class ChessModel:
@@ -51,7 +63,8 @@ class ChessModel:
         board: chess.Board,
         move_history: list[int],
         temperature: float,
-        value_weight: float,
+        blunder_threshold: float,
+        is_self_play: bool,
         use_kv_cache: bool,
         kv_cache: KVCache,
         kv_cache_tokens: int,
@@ -70,7 +83,8 @@ class ChessModel:
                 move_history=move_history,
                 device=self.__device,
                 temperature=temperature,
-                value_weight=value_weight,
+                blunder_threshold=blunder_threshold,
+                is_self_play=is_self_play,
                 cache=kv_cache,
                 cache_tokens=kv_cache_tokens,
             )
@@ -83,7 +97,8 @@ class ChessModel:
             move_history=move_history,
             device=self.__device,
             temperature=temperature,
-            value_weight=value_weight,
+            blunder_threshold=blunder_threshold,
+            is_self_play=is_self_play,
         )
         return move, KVCache()
 
@@ -92,7 +107,7 @@ class ChessModel:
         from safetensors.torch import load_file
 
         with open(f"{path}/config.json") as f:
-            config = ChessTrainingConfig(**json.load(f))
+            config = _config_from_dict(json.load(f))
 
         tokenizer = ChessTokenizer()
         model = cls._build_model(config, tokenizer)
@@ -118,7 +133,7 @@ class ChessModel:
         checkpoint = torch.load(path, map_location=device, weights_only=True)
         config_data = checkpoint["config"]
         config = (
-            ChessTrainingConfig(**config_data) if isinstance(config_data, dict) else config_data
+            _config_from_dict(config_data) if isinstance(config_data, dict) else config_data
         )
         tokenizer = ChessTokenizer()
         model = cls._build_model(config, tokenizer)
@@ -161,7 +176,8 @@ class ChessGame:
 
     __chess_model: ChessModel
     __temperature: float
-    __value_weight: float
+    __blunder_threshold: float
+    __is_self_play: bool
     __use_kv_cache: bool
     __player_color: chess.Color | None
     __board: chess.Board
@@ -173,21 +189,26 @@ class ChessGame:
         self,
         chess_model: ChessModel,
         temperature: float = 1.0,
-        value_weight: float = 0.0,
+        blunder_threshold: float = 0.15,
+        is_self_play: bool = False,
         use_kv_cache: bool = False,
     ) -> None:
         """
         Args:
-            chess_model:  shared ChessModel instance (weights + tokenizer + device).
-            temperature:  softmax temperature for move sampling; <1 = sharper, >1 = more random.
-            value_weight: blend policy logits with value head output.
-                          0.0 = pure policy; higher values shift selection toward value-guided moves.
-            use_kv_cache: reuse K/V from previous moves each turn; faster per-step but holds the
-                          cache in memory for the duration of the game.
+            chess_model:       shared ChessModel instance (weights + tokenizer + device).
+            temperature:       softmax temperature for move sampling; <1 = sharper, >1 = more random.
+            blunder_threshold: max allowed value-head gap from the best candidate (in tanh-value units,
+                               ~0.15 ≈ 60cp). Candidate moves with a larger gap are excluded before
+                               picking. See MOVE_PICKING.md.
+            is_self_play:      True → pick by sampling among survivors (exploration); False → argmax
+                               among survivors (deterministic play).
+            use_kv_cache:      reuse K/V from previous moves each turn; faster per-step but holds the
+                               cache in memory for the duration of the game.
         """
         self.__chess_model = chess_model
         self.__temperature = temperature
-        self.__value_weight = value_weight
+        self.__blunder_threshold = blunder_threshold
+        self.__is_self_play = is_self_play
         self.__use_kv_cache = use_kv_cache
         self.__player_color = None
         self.__board = chess.Board()
@@ -208,7 +229,8 @@ class ChessGame:
             board=self.__board,
             move_history=self.__move_history,
             temperature=self.__temperature,
-            value_weight=self.__value_weight,
+            blunder_threshold=self.__blunder_threshold,
+            is_self_play=self.__is_self_play,
             use_kv_cache=self.__use_kv_cache,
             kv_cache=self.__kv_cache,
             kv_cache_tokens=self.__kv_cache_tokens,

@@ -539,9 +539,10 @@ Key properties:
 
 Self-play-only chunk generation additionally respects
 `self_play_max_moves` (hard draw cap), and uses
-`self_play_value_weight` to blend the value head into move selection
-during generation, so the model tends to pick moves that *it* rates as
-leading to good positions.
+`self_play_blunder_threshold` as the value-gap mask that filters
+candidate moves before the policy sample — obvious blunders (by the
+value head's own evaluation) are excluded before sampling. See
+[MOVE_PICKING.md](MOVE_PICKING.md).
 
 #### Heap fragmentation mitigation
 
@@ -680,8 +681,9 @@ many concurrent games (e.g. the Gradio app running N parallel sessions):
   inference step. One `ChessModel` per model artifact, shared across all games.
 - **`ChessGame`** — one per game. Owns the `chess.Board`, the move-history
   token list, the player colour, a per-game `KVCache`, and the sampling
-  hyperparameters (`temperature`, `value_weight`, `use_kv_cache`). Delegates
-  the actual forward pass to the shared `ChessModel`.
+  hyperparameters (`temperature`, `blunder_threshold`, `is_self_play`,
+  `use_kv_cache`). Delegates the actual forward pass to the shared
+  `ChessModel`.
 
 `ChessGame.sample_move()` dispatches to one of two sampling paths depending on
 the constructor flag `use_kv_cache`:
@@ -693,8 +695,8 @@ Calls `sample_move`, which runs a full forward pass over the complete move histo
 1. Enumerate `board.legal_moves` and encode each as a token ID
 2. Run `model.forward([BOS, m1, ..., m_{t-1}])` — full sequence forward pass
 3. Extract logits at the last position; slice to legal token IDs only
-4. Optionally blend with value scores (see below)
-5. Sample from softmax with temperature
+4. Batched forward over all resulting positions for value-head scores
+5. Mask blunders by value gap, then pick (argmax for play, sample for self-play)
 
 #### With KV cache (`use_kv_cache=True`)
 
@@ -705,17 +707,18 @@ accumulates across moves:
 - Only tokens added since the previous call are processed — O(1) per turn once warmed up
 - The cache is reset at the start of each new game
 
-#### Value-Weighted Move Selection
+#### Value-Gap Masking
 
-When `value_weight > 0`, both sampling paths additionally score each legal move by the value head's evaluation of the resulting position:
+Both sampling paths score every legal move via the value head — a single batched `generate_step` over all legal moves (sharing the same cache prefix), with the sign flipped for Black to move so scores are always from the side-to-move perspective.
 
-```
-final_score[i] = policy_logit[i] + λ × value(board after move_i)
-```
+Candidate moves whose value score is more than `blunder_threshold` below the best candidate are then excluded via a boolean mask before the policy head picks. In tanh-value units, `0.15 ≈ 60 cp` (strict, good for play against a human), `0.25 ≈ 100 cp` (default for self-play). See [MOVE_PICKING.md](MOVE_PICKING.md) for the full design.
 
-The value scores are obtained in a single batched `generate_step` over all legal moves simultaneously (sharing the same cache prefix), then flipped in sign for Black to move. `λ = 0.0` is pure policy; higher values shift move selection toward positions the value head rates as good.
+Picking depends on the `is_self_play` flag:
 
-Temperature controls play style: `< 1.0` makes play more deterministic, `> 1.0` makes play more random.
+- `is_self_play=False` (human play) — argmax of policy among survivors. Deterministic.
+- `is_self_play=True` (self-play generation) — sample from softmax(policy) among survivors. Preserves exploration while excluding blunders.
+
+Temperature controls policy sharpness: `< 1.0` concentrates mass on the top policy moves, `> 1.0` flattens. Only affects the stochastic (`is_self_play=True`) path — argmax is insensitive to temperature.
 
 Models are loaded via `ChessModel.load(path, device)`, which auto-detects
 whether `path` is a safetensors directory (produced by `save_model`) or a
@@ -746,7 +749,7 @@ whether `path` is a safetensors directory (produced by `save_model`) or a
 | `self_play_max_ratio` | 0.30 | Max self-play fraction |
 | `self_play_batch_size` | 256 | Games generated in parallel per SelfPlayGPU batch |
 | `self_play_loss_mode` | `advantage_weighted` | See [SELF_PLAY_LOSS.md](SELF_PLAY_LOSS.md) |
-| `self_play_value_weight` | 0.5 | Blend value head into move selection during self-play generation |
+| `self_play_blunder_threshold` | 0.25 | Value-gap mask for candidate moves during self-play (see [MOVE_PICKING.md](MOVE_PICKING.md)) |
 | `self_play_max_moves` | 84 | Hard draw cap for self-play games |
 | `self_play_kv_cache` | True | Use KV cache during self-play generation |
 | `streaming` | True | Chunked epoch, one optimizer step per epoch |

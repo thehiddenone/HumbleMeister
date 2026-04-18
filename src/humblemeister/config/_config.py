@@ -99,7 +99,10 @@ class ChessTrainingConfig:
     advantage_temperature: float = 1.0  # sharpness of per-move weight distribution
     value_loss_weight: float = 0.5  # relative weight of value loss vs policy loss
     self_play_kv_cache: bool = True  # use KV cache during self-play generation
-    self_play_value_weight: float = 0.5  # weight for value-blended move selection during self-play
+    self_play_blunder_threshold: float = 0.25
+    """Value-gap threshold for masking candidate moves during self-play (tanh-value units;
+    0.25 ≈ 100 cp). Moves whose value score is more than this below the best candidate are
+    excluded before the policy sample. See MOVE_PICKING.md."""
     self_play_max_moves: int = 84  # hard draw cap for self-play games
     self_play_loss_mode: str = (
         SelfPlayLossMode.ADVANTAGE_WEIGHTED

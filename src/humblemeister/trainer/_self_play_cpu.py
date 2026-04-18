@@ -67,7 +67,7 @@ def _worker_fn(
     n_games: int,
     output_path: str,
     temperature: float,
-    value_weight: float,
+    blunder_threshold: float,
     use_kv_cache: bool,
     max_moves: int,
     stockfish_path: str,
@@ -89,7 +89,11 @@ def _worker_fn(
     log_path = output_path.replace(".pt", ".log")
     chess_model = ChessModel.load(model_path, device="cpu")
     engine = ChessGame(
-        chess_model, temperature=temperature, value_weight=value_weight, use_kv_cache=use_kv_cache
+        chess_model,
+        temperature=temperature,
+        blunder_threshold=blunder_threshold,
+        is_self_play=True,
+        use_kv_cache=use_kv_cache,
     )
 
     games: list[dict[str, Any]] = []
@@ -160,7 +164,7 @@ class SelfPlayCPU:
         n_workers: int = 1,
         max_moves: int = 160,
         temperature: float = 1.0,
-        value_weight: float = 1.0,
+        blunder_threshold: float = 0.25,
         use_kv_cache: bool = True,
         stockfish_path: str = "stockfish",
         stockfish_depth: int = 5,
@@ -175,7 +179,8 @@ class SelfPlayCPU:
             max_moves:             hard cap on game length (half-moves / plies); when reached
                                    Stockfish evaluates the position to determine the winner.
             temperature:           move-sampling temperature passed to ChessGame.
-            value_weight:          value-head blend weight passed to ChessGame (0 = pure policy).
+            blunder_threshold:     value-gap threshold for masking candidate moves (tanh-value
+                                   units; 0.25 ≈ 100 cp). Passed through to ChessGame.
             use_kv_cache:          whether ChessGame uses KV caching during generation.
             stockfish_path:        path to the Stockfish binary.
             stockfish_depth:       Stockfish search depth used for both outcome determination
@@ -191,7 +196,7 @@ class SelfPlayCPU:
         self._n_workers = n_workers
         self._max_moves = max_moves
         self._temperature = temperature
-        self._value_weight = value_weight
+        self._blunder_threshold = blunder_threshold
         self._use_kv_cache = use_kv_cache
         self._stockfish_path = stockfish_path
         self._stockfish_depth = stockfish_depth
@@ -259,7 +264,7 @@ class SelfPlayCPU:
                         count,
                         str(out_path),
                         self._temperature,
-                        self._value_weight,
+                        self._blunder_threshold,
                         self._use_kv_cache,
                         self._max_moves,
                         self._stockfish_path,  # always needed for max_moves outcome evaluation

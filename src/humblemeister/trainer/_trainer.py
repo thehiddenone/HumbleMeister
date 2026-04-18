@@ -106,7 +106,7 @@ class ChessTrainer:
         self.__self_play = SelfPlayGPU(
             batch_size=config.self_play_batch_size,
             max_moves=config.self_play_max_moves,
-            value_weight=config.self_play_value_weight,
+            blunder_threshold=config.self_play_blunder_threshold,
             stockfish_path=config.stockfish_path,
             stockfish_depth=config.stockfish_depth,
             stockfish_workers=config.stockfish_workers,
@@ -732,7 +732,7 @@ class ChessTrainer:
         self_play_min: float | None = None,
         self_play_max: float | None = None,
         self_play_stockfish_depth: int | None = 5,
-        self_play_value_weight: float | None = None,
+        self_play_blunder_threshold: float | None = None,
     ) -> None:
         """Start training from scratch (epoch 0).  Clears existing checkpoints."""
         if self.checkpoints_path.exists():
@@ -752,7 +752,7 @@ class ChessTrainer:
             self_play_min=self_play_min,
             self_play_max=self_play_max,
             self_play_stockfish_depth=self_play_stockfish_depth,
-            self_play_value_weight=self_play_value_weight,
+            self_play_blunder_threshold=self_play_blunder_threshold,
         )
 
     def resume(
@@ -764,7 +764,7 @@ class ChessTrainer:
         self_play_min: float | None = None,
         self_play_max: float | None = None,
         self_play_stockfish_depth: int | None = 5,
-        self_play_value_weight: float | None = None,
+        self_play_blunder_threshold: float | None = None,
     ) -> None:
         """Resume training from the latest checkpoint.
 
@@ -818,7 +818,7 @@ class ChessTrainer:
             self_play_min=self_play_min,
             self_play_max=self_play_max,
             self_play_stockfish_depth=self_play_stockfish_depth,
-            self_play_value_weight=self_play_value_weight,
+            self_play_blunder_threshold=self_play_blunder_threshold,
         )
 
     def __train_loop(
@@ -829,7 +829,7 @@ class ChessTrainer:
         self_play_min: float | None,
         self_play_max: float | None,
         self_play_stockfish_depth: int | None,
-        self_play_value_weight: float | None,
+        self_play_blunder_threshold: float | None,
     ) -> None:
         print(f"training on {self.__config.device}")
         print(f"model parameters: {sum(p.numel() for p in self.__model.parameters()):,}")
@@ -838,9 +838,9 @@ class ChessTrainer:
         self.__selfplay_min_override = self_play_min
         self.__selfplay_max_override = self_play_max
         if self_play_stockfish_depth is not None:
-            self.__self_play._stockfish_depth = self_play_stockfish_depth
-        if self_play_value_weight is not None:
-            self.__self_play._value_weight = self_play_value_weight
+            self.__self_play.__stockfish_depth = self_play_stockfish_depth
+        if self_play_blunder_threshold is not None:
+            self.__self_play.__blunder_threshold = self_play_blunder_threshold
         self.__run_start_epoch = start_epoch
         self.__run_end_epoch = end_epoch
 
@@ -855,14 +855,12 @@ class ChessTrainer:
                 ratio = self._self_play_ratio(epoch)
                 n_sp = int(self.__config.n_games * ratio)
                 n_bank = self.__config.n_games - n_sp
-                loss, value_loss, stepped = self.__run_epoch_streaming(
-                    epoch, n_bank, n_sp, ratio
-                )
+                loss, value_loss, stepped = self.__run_epoch_streaming(epoch, n_bank, n_sp, ratio)
             else:
                 ratio = self.generate_games(epoch)
                 loss, value_loss, stepped = self.train_on_games(epoch, ratio)
             if not stepped:
-                raise RuntimeError('The trainer has failed to make a step.')
+                raise RuntimeError("The trainer has failed to make a step.")
 
             self.__scheduler.step()
 

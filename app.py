@@ -45,6 +45,7 @@ def _board_svg(board: chess.Board, player_color: chess.Color) -> str:
 def start_or_surrender(
     model_name: str,
     color_choice: str,
+    blunder_threshold: float,
     game: ChessGame | None,
 ) -> tuple[str, str, str, ChessGame | None, dict]:
     """Start a new game, or surrender the current one if a game is in progress."""
@@ -60,8 +61,14 @@ def start_or_surrender(
         board_html = _board_svg(game.board, player_color) if game else ""
         return board_html, color_choice, "Please select a model first.", game, _btn_start()
 
+    if blunder_threshold is None or blunder_threshold < 0.0:
+        board_html = _board_svg(game.board, player_color) if game else ""
+        return board_html, color_choice, "Blunder threshold must be a number ≥ 0.0.", game, _btn_start()
+
     chess_model = _get_model(model_name)
-    game = ChessGame(chess_model, value_weight=1.0, use_kv_cache=True)
+    game = ChessGame(
+        chess_model, blunder_threshold=float(blunder_threshold), use_kv_cache=True
+    )
     game.start_game(player_color)
 
     status = "Your turn." if player_color == chess.WHITE else "Model played. Your turn."
@@ -183,6 +190,12 @@ with gr.Blocks(title="HumbleMeister Chess") as demo:
             value="White",
             label="Your color",
         )
+        blunder_threshold_input = gr.Number(
+            value=0.15,
+            minimum=0.0,
+            step=0.05,
+            label="Blunder threshold (tanh-value gap; ~0.15 ≈ 60cp — lower = more conservative)",
+        )
         start_btn = gr.Button("Start game", variant="primary")
 
     board_svg = gr.HTML(label="Board")
@@ -205,7 +218,7 @@ with gr.Blocks(title="HumbleMeister Chess") as demo:
 
     start_btn.click(
         fn=start_or_surrender,
-        inputs=[model_dropdown, color_radio, game_state],
+        inputs=[model_dropdown, color_radio, blunder_threshold_input, game_state],
         outputs=[board_svg, color_state, status_box, game_state, start_btn],
     )
 
