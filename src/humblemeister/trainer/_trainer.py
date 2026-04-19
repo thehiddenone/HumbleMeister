@@ -46,20 +46,26 @@ def get_scheduler(
     n_epochs: int,
     warmup_epochs: int,
     start_epoch: int = 0,
+    baseline_epoch: int = 0,
 ) -> LambdaLR:
     """Cosine-annealing LR with linear warmup.
 
-    The cosine curve spans [warmup_epochs, n_epochs].  ``start_epoch``
-    offsets the internal step counter so that ``step=0`` corresponds to
-    ``epoch=start_epoch`` — this lets a resumed run pick up at the correct
-    position on the curve without replaying scheduler steps.
+    ``start_epoch`` offsets the internal step counter so that ``step=0``
+    corresponds to ``epoch=start_epoch`` — this lets a resumed run pick up at
+    the correct position on the curve without replaying scheduler steps.
+
+    ``baseline_epoch`` shifts the curve so that the scheduler treats
+    ``epoch=baseline_epoch`` as its effective epoch 0 (warmup + cosine decay
+    both begin there, and the cosine's span shrinks to
+    ``n_epochs - baseline_epoch``). Used to restart the LR schedule mid-training
+    while keeping global epoch numbers monotonically increasing.
     """
 
     def lr_lambda(step: int) -> float:
-        epoch = start_epoch + step
+        epoch = start_epoch + step - baseline_epoch
         if epoch < warmup_epochs:
             return epoch / max(warmup_epochs, 1)
-        progress = (epoch - warmup_epochs) / max(n_epochs - warmup_epochs, 1)
+        progress = (epoch - warmup_epochs) / max(n_epochs - baseline_epoch - warmup_epochs, 1)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return LambdaLR(optimizer, lr_lambda)
@@ -80,6 +86,7 @@ class ChessTrainer:
     __selfplay_max_override: float | None
     __run_start_epoch: int
     __run_end_epoch: int
+    __baseline_epoch: int
     __self_play: SelfPlayGPU
     __sp_gen_time_s: float
     __sp_eval_time_s: float
@@ -95,6 +102,7 @@ class ChessTrainer:
         self.__selfplay_max_override: float | None = None
         self.__run_start_epoch = 0
         self.__run_end_epoch = config.n_epochs
+        self.__baseline_epoch = 0
         self.__tokenizer = ChessTokenizer()
         self.__dataset = ChessDataset(self.__tokenizer)
         self.__gamebank = game_bank
@@ -731,25 +739,53 @@ class ChessTrainer:
     def run(
         self,
         max_epochs: int | None = None,
+        from_checkpoint_epoch: int | None = None,
         disable_selfplay: bool = False,
         self_play_min: float | None = None,
         self_play_max: float | None = None,
         self_play_stockfish_depth: int | None = 5,
         self_play_blunder_threshold: float | None = None,
     ) -> None:
-        """Start training from scratch (epoch 0).  Clears existing checkpoints."""
-        if self.checkpoints_path.exists():
-            shutil.rmtree(self.checkpoints_path)
-        os.makedirs(self.checkpoints_path, exist_ok=True)
+        """Start training.
+
+        ``max_epochs`` is the absolute global epoch to stop at, not a relative
+        offset from the starting epoch. With ``from_checkpoint_epoch=1700,
+        max_epochs=2700`` the run trains global epochs 1701..2699.
+
+        When ``from_checkpoint_epoch`` is None, this is a fresh run: existing
+        checkpoints are cleared and training starts at epoch 0 with the full
+        LR curve spanning [0, max_epochs].
+
+        When ``from_checkpoint_epoch`` is provided, load that specific
+        checkpoint and restart the LR schedule from there — the scheduler
+        treats ``from_checkpoint_epoch`` as its effective epoch 0, so warmup +
+        cosine decay both begin there. Global epoch numbers keep rising
+        monotonically, training continues over
+        [from_checkpoint_epoch + 1, max_epochs). Existing checkpoints are
+        preserved; raises if the requested checkpoint file is missing.
+        """
+        if from_checkpoint_epoch is None:
+            if self.checkpoints_path.exists():
+                shutil.rmtree(self.checkpoints_path)
+            os.makedirs(self.checkpoints_path, exist_ok=True)
+            start_epoch = 0
+            self.__baseline_epoch = 0
+        else:
+            os.makedirs(self.checkpoints_path, exist_ok=True)
+            self.__load_checkpoint_at(from_checkpoint_epoch)
+            start_epoch = from_checkpoint_epoch + 1
+            self.__baseline_epoch = from_checkpoint_epoch
 
         end_epoch = max_epochs or self.__config.n_epochs
         self.__scheduler = get_scheduler(
             self.__optimizer,
             end_epoch,
             self.__config.warmup_epochs,
+            start_epoch=start_epoch,
+            baseline_epoch=self.__baseline_epoch,
         )
         self.__train_loop(
-            start_epoch=0,
+            start_epoch=start_epoch,
             end_epoch=end_epoch,
             disable_selfplay=disable_selfplay,
             self_play_min=self_play_min,
@@ -810,6 +846,7 @@ class ChessTrainer:
             target_end,
             self.__config.warmup_epochs,
             start_epoch=current,
+            baseline_epoch=self.__baseline_epoch,
         )
         print(
             f"LR curve: epoch {current} → {target_end} " f"(warmup {self.__config.warmup_epochs})"
@@ -952,6 +989,7 @@ class ChessTrainer:
             {
                 "epoch": epoch,
                 "end_epoch": self.__run_end_epoch,
+                "baseline_epoch": self.__baseline_epoch,
                 "model_state": self.__model.state_dict(),
                 "optimizer_state": self.__optimizer.state_dict(),
                 "loss": loss,
@@ -965,17 +1003,11 @@ class ChessTrainer:
         for old in checkpoints[: -self.__config.keep_last_n]:
             old.unlink()
 
-    def __load_latest_checkpoint(self) -> dict[str, Any] | None:
-        """Load the latest checkpoint, restoring model and optimizer state.
-
-        Returns the raw checkpoint dict (with keys ``epoch``, ``end_epoch``,
-        ``loss``, etc.) or ``None`` if no checkpoints exist.
+    def __load_checkpoint_file(self, path: Path) -> dict[str, Any]:
+        """Load a checkpoint file into model/optimizer state, plus trainer-
+        side fields (``last_loss``, ``baseline_epoch``). ``baseline_epoch``
+        defaults to 0 for checkpoints written before the field existed.
         """
-        checkpoints = sorted(self.checkpoints_path.glob("checkpoint_epoch_*.pt"))
-        if not checkpoints:
-            return None
-
-        path = checkpoints[-1]
         checkpoint = torch.load(path, map_location=self.__device, weights_only=True)
 
         result = self.__model.load_state_dict(checkpoint["model_state"], strict=False)
@@ -988,21 +1020,27 @@ class ChessTrainer:
         except ValueError:
             print("  optimizer state incompatible (model changed), starting optimizer fresh")
         self.__last_loss = float(checkpoint["loss"])
+        self.__baseline_epoch = int(checkpoint.get("baseline_epoch", 0))
 
         print(
             f"resumed from {path.name} (epoch {checkpoint['epoch']}, loss {checkpoint['loss']:.4f})"
         )
         return dict(checkpoint)
 
-    def _check_tensors(self, label: str, **tensors: torch.Tensor) -> bool:
-        """Returns True if any tensor contains NaN or inf."""
-        found = False
-        for name, t in tensors.items():
-            has_nan = torch.isnan(t).any().item()
-            has_inf = torch.isinf(t).any().item()
-            if has_nan or has_inf:
-                print(
-                    f"  {label} — {name}: nan={has_nan} inf={has_inf} min={t.min():.4f} max={t.max():.4f}"
-                )
-                found = True
-        return found
+    def __load_latest_checkpoint(self) -> dict[str, Any] | None:
+        """Load the latest checkpoint, restoring model and optimizer state.
+
+        Returns the raw checkpoint dict (with keys ``epoch``, ``end_epoch``,
+        ``loss``, etc.) or ``None`` if no checkpoints exist.
+        """
+        checkpoints = sorted(self.checkpoints_path.glob("checkpoint_epoch_*.pt"))
+        if not checkpoints:
+            return None
+        return self.__load_checkpoint_file(checkpoints[-1])
+
+    def __load_checkpoint_at(self, epoch: int) -> dict[str, Any]:
+        """Load a specific checkpoint by epoch number. Raises if missing."""
+        path = self.__get_checkpoint_path(epoch)
+        if not path.exists():
+            raise RuntimeError(f"no checkpoint at epoch {epoch}: {path}")
+        return self.__load_checkpoint_file(path)
