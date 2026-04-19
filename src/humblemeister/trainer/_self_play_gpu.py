@@ -47,7 +47,9 @@ class SelfPlayGPU:
         self,
         batch_size: int = 1,
         max_moves: int = 120,
-        temperature: float = 1.0,
+        start_temperature: float = 1.0,
+        end_temperature: float = 0.05,
+        anneal_moves: int = 40,
         blunder_threshold: float = 0.25,
         stockfish_path: str = "stockfish",
         stockfish_depth: int = 5,
@@ -62,7 +64,11 @@ class SelfPlayGPU:
             batch_size:            number of games to run in parallel per `_play_game` call.
             max_moves:             hard cap on game length (half-moves); Stockfish evaluates
                                    the final position when the cap is reached.
-            temperature:           softmax temperature for policy sampling.
+            start_temperature:     softmax temperature at move 0 (high = exploratory).
+            end_temperature:       softmax temperature at move `anneal_moves` and beyond
+                                   (low = decisive, approaches argmax).
+            anneal_moves:          plies over which temperature linearly anneals from
+                                   start → end. After this the temperature stays at end.
             blunder_threshold:     max allowed value-head gap from the best candidate, in tanh-value
                                    units (0.25 ≈ 100 cp). Candidate moves beyond this gap are
                                    excluded before sampling the policy.
@@ -76,7 +82,9 @@ class SelfPlayGPU:
         """
         self.__batch_size = batch_size
         self.__max_moves = max_moves
-        self.__temperature = temperature
+        self.__start_temperature = start_temperature
+        self.__end_temperature = end_temperature
+        self.__anneal_moves = anneal_moves
         self.__blunder_threshold = blunder_threshold
         self.__stockfish_path = stockfish_path
         self.__stockfish_depth = stockfish_depth
@@ -85,6 +93,14 @@ class SelfPlayGPU:
         self.__draw_lo = draw_score_lo
         self.__draw_hi = draw_score_hi
         self.__bf16 = bf16
+
+    def _temperature_for(self, move_num: int) -> float:
+        """Linearly anneal temperature from start → end over the first `anneal_moves` plies."""
+        anneal_t = min(move_num / max(self.__anneal_moves, 1), 1.0)
+        return (
+            self.__start_temperature
+            + (self.__end_temperature - self.__start_temperature) * anneal_t
+        )
 
     def _play_game(
         self,
@@ -172,7 +188,8 @@ class SelfPlayGPU:
                     device=device,
                 )  # [n_legal]
 
-                legal_policy = policy_logits[i][legal_tids] / self.__temperature
+                temperature = self._temperature_for(len(board.move_stack))
+                legal_policy = policy_logits[i][legal_tids] / (temperature + 1e-8)
 
                 # Batched full recompute over all resulting positions for this game.
                 # Peak memory: one layer of [n_legal, seq_len+1, d_model] at a time.

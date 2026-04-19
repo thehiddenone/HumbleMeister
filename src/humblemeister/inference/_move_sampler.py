@@ -165,7 +165,7 @@ def sample_move(
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16 and device.type == "cuda"):
             logits, _ = model(input_ids, is_causal=True)
 
-    policy_logits = logits[0, -1].clone() / temperature  # [vocab_size]
+    policy_logits = logits[0, -1].clone() / (temperature + 1e-8)  # [vocab_size]
     del logits, _
 
     # ------------------------------------------------------------------ #
@@ -280,7 +280,7 @@ def sample_move_kv_cache(
                 logits, _, cache = model.generate_step(token, cache)
             if logits is None:
                 raise RuntimeError("Unexpected: no tokens were processed")
-            policy_logits = logits[0, 0] / temperature  # [vocab_size]
+            policy_logits = logits[0, 0] / (temperature + 1e-8)  # [vocab_size]
 
     # ------------------------------------------------------------------ #
     #  Step 2: legal move token IDs and their policy scores              #

@@ -66,7 +66,9 @@ def _worker_fn(
     model_path: str,
     n_games: int,
     output_path: str,
-    temperature: float,
+    start_temperature: float,
+    end_temperature: float,
+    anneal_moves: int,
     blunder_threshold: float,
     use_kv_cache: bool,
     max_moves: int,
@@ -90,7 +92,9 @@ def _worker_fn(
     chess_model = ChessModel.load(model_path, device="cpu")
     engine = ChessGame(
         chess_model,
-        temperature=temperature,
+        start_temperature=start_temperature,
+        end_temperature=end_temperature,
+        anneal_moves=anneal_moves,
         blunder_threshold=blunder_threshold,
         is_self_play=True,
         use_kv_cache=use_kv_cache,
@@ -163,7 +167,9 @@ class SelfPlayCPU:
         self,
         n_workers: int = 1,
         max_moves: int = 160,
-        temperature: float = 1.0,
+        start_temperature: float = 1.0,
+        end_temperature: float = 0.05,
+        anneal_moves: int = 40,
         blunder_threshold: float = 0.25,
         use_kv_cache: bool = True,
         stockfish_path: str = "stockfish",
@@ -178,7 +184,11 @@ class SelfPlayCPU:
             n_workers:             maximum number of parallel child processes for generation.
             max_moves:             hard cap on game length (half-moves / plies); when reached
                                    Stockfish evaluates the position to determine the winner.
-            temperature:           move-sampling temperature passed to ChessGame.
+            start_temperature:     softmax temperature at move 0 (high = exploratory).
+            end_temperature:       softmax temperature at `anneal_moves` and beyond (near-argmax
+                                   = decisive).
+            anneal_moves:          plies over which the temperature linearly anneals from
+                                   start_temperature → end_temperature.
             blunder_threshold:     value-gap threshold for masking candidate moves (tanh-value
                                    units; 0.25 ≈ 100 cp). Passed through to ChessGame.
             use_kv_cache:          whether ChessGame uses KV caching during generation.
@@ -195,7 +205,9 @@ class SelfPlayCPU:
         """
         self._n_workers = n_workers
         self._max_moves = max_moves
-        self._temperature = temperature
+        self._start_temperature = start_temperature
+        self._end_temperature = end_temperature
+        self._anneal_moves = anneal_moves
         self._blunder_threshold = blunder_threshold
         self._use_kv_cache = use_kv_cache
         self._stockfish_path = stockfish_path
@@ -263,7 +275,9 @@ class SelfPlayCPU:
                         str(model_path),
                         count,
                         str(out_path),
-                        self._temperature,
+                        self._start_temperature,
+                        self._end_temperature,
+                        self._anneal_moves,
                         self._blunder_threshold,
                         self._use_kv_cache,
                         self._max_moves,

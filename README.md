@@ -11,5 +11,6 @@ A Gradio web app (`app.py`) lets you play against the engine or watch it play it
 ## Documentation
 
 - [MODEL.md](MODEL.md) — architecture, tokenization, training loop, data pipeline, inference, and hyperparameters
+- [MOVE_PICKING.md](MOVE_PICKING.md) — inference-time move selection: mate-in-1 short-circuit, value-gap masking, and the self-play temperature anneal
 - [SELF_PLAY_LOSS.md](SELF_PLAY_LOSS.md) — loss function design for self-play games and the policy/value weighting modes
 - [FLASH_ATTENTION.md](FLASH_ATTENTION.md) — Flash Attention integration and the length-bucketed batch sampler that eliminates padding contamination

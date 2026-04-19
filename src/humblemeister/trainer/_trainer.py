@@ -106,6 +106,9 @@ class ChessTrainer:
         self.__self_play = SelfPlayGPU(
             batch_size=config.self_play_batch_size,
             max_moves=config.self_play_max_moves,
+            start_temperature=config.self_play_start_temperature,
+            end_temperature=config.self_play_end_temperature,
+            anneal_moves=config.self_play_anneal_moves,
             blunder_threshold=config.self_play_blunder_threshold,
             stockfish_path=config.stockfish_path,
             stockfish_depth=config.stockfish_depth,

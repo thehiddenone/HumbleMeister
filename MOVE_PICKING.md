@@ -206,15 +206,70 @@ contract is:
 Replaced by `blunder_threshold`, which is conceptually cleaner:
 the value head's job is "veto blunders", not "nudge the policy".
 
+## Self-play temperature annealing
+
+`pick_move_selfplay` samples from `softmax(policy / temperature)` among
+value-gap survivors. Using a single fixed temperature across a whole game
+is the wrong shape — early moves benefit from exploration (wide opening
+diversity across the self-play corpus), but late-game positions are much
+more constrained and noisy sampling just produces draws from positions
+that should be won.
+
+The self-play picker therefore linearly anneals the temperature from
+`start_temperature` down to `end_temperature` over the first
+`anneal_moves` plies, then holds at `end_temperature` for the rest of
+the game:
+
+```python
+def _temperature_for(move_num: int) -> float:
+    t = min(move_num / max(anneal_moves, 1), 1.0)
+    return start_temperature + (end_temperature - start_temperature) * t
+```
+
+Defaults:
+
+| Field                | Default | Intent                                         |
+|----------------------|---------|------------------------------------------------|
+| `start_temperature`  | 1.0     | Unmodified softmax — maximum exploration       |
+| `end_temperature`    | 0.05    | Near-argmax — decisive play to close out games |
+| `anneal_moves`       | 40      | Anneal over the opening / early middlegame     |
+
+A guard `+ 1e-8` is added to the temperature at every division site so
+`end_temperature = 0.0` (pure argmax among survivors) is legal without
+causing a divide-by-zero.
+
+This interacts cleanly with the value-gap mask: the mask still prunes
+blunders at every move, and the annealed softmax governs how stochastic
+the pick is *among* non-blunders. Human-play (`pick_move_play`) is
+unaffected — it ignores temperature entirely and takes the argmax.
+
+The schedule lives on both self-play paths:
+
+- **GPU self-play** (`SelfPlayGPU`): `_temperature_for(len(board.move_stack))`
+  is called once per game per step before the policy softmax.
+- **CPU self-play** (`SelfPlayCPU` → `ChessGame`): `ChessGame` computes
+  the same schedule inside `sample_move` when `is_self_play=True`.
+
 ## Configuration
 
-New field on `ChessTrainingConfig` in `src/humblemeister/config/_config.py`:
+New fields on `ChessTrainingConfig` in `src/humblemeister/config/_config.py`:
 
 ```python
 self_play_blunder_threshold: float = 0.25
 """Value-gap threshold for masking candidate moves during self-play.
 Moves whose value score is more than this much below the best candidate
 are excluded before policy sampling. In tanh-value units: 0.25 ≈ 100cp."""
+
+self_play_start_temperature: float = 1.0
+"""Softmax temperature at move 0 of a self-play game (high = exploratory)."""
+
+self_play_end_temperature: float = 0.05
+"""Softmax temperature at move self_play_anneal_moves and beyond
+(near-argmax = decisive)."""
+
+self_play_anneal_moves: int = 40
+"""Plies over which the temperature linearly anneals from
+self_play_start_temperature down to self_play_end_temperature."""
 ```
 
 Defaults:
@@ -289,12 +344,18 @@ training-loop changes either way.
   filters unknown config fields so older checkpoints still load.
 - `src/humblemeister/config/_config.py` — new
   `self_play_blunder_threshold` field on `ChessTrainingConfig`
-  (replaces `self_play_value_weight`).
+  (replaces `self_play_value_weight`); plus three new fields for the
+  self-play temperature schedule: `self_play_start_temperature`,
+  `self_play_end_temperature`, `self_play_anneal_moves`.
 - `src/humblemeister/trainer/_self_play_gpu.py` (and CPU equivalent) —
   pass `config.self_play_blunder_threshold` through to the sampler. The
   CPU worker sets `is_self_play=True` on the `ChessGame` it constructs.
+  Both paths replace a single `temperature` knob with the
+  `start_temperature` / `end_temperature` / `anneal_moves` schedule and
+  call `_temperature_for(move_num)` per step.
 - `src/humblemeister/trainer/_trainer.py` — `run()` / `resume()` /
   `__train_loop` rename `self_play_value_weight` →
-  `self_play_blunder_threshold`.
+  `self_play_blunder_threshold`; `SelfPlayGPU` construction passes the
+  three temperature-schedule fields from the config.
 - `app.py` — replace the `value_weight` Gradio input with a
   `blunder_threshold` input, same validation shape (float ≥ 0).

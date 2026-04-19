@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from pathlib import Path
+from typing import Any
 
 import chess
 import chess.svg
@@ -15,7 +16,7 @@ from .inference import sample_move, sample_move_kv_cache
 from .transformer import ChessTransformer
 
 
-def _config_from_dict(raw: dict) -> ChessTrainingConfig:
+def _config_from_dict(raw: dict[str, Any]) -> ChessTrainingConfig:
     """Build a ChessTrainingConfig from a possibly-stale dict.
 
     Older checkpoints may carry fields that have since been removed from the
@@ -132,9 +133,7 @@ class ChessModel:
     def from_pt(cls, path: str, device: str = "cpu") -> ChessModel:
         checkpoint = torch.load(path, map_location=device, weights_only=True)
         config_data = checkpoint["config"]
-        config = (
-            _config_from_dict(config_data) if isinstance(config_data, dict) else config_data
-        )
+        config = _config_from_dict(config_data) if isinstance(config_data, dict) else config_data
         tokenizer = ChessTokenizer()
         model = cls._build_model(config, tokenizer)
         model.load_state_dict(checkpoint["model_state"])
@@ -176,6 +175,9 @@ class ChessGame:
 
     __chess_model: ChessModel
     __temperature: float
+    __start_temperature: float
+    __end_temperature: float
+    __anneal_moves: int
     __blunder_threshold: float
     __is_self_play: bool
     __use_kv_cache: bool
@@ -189,6 +191,9 @@ class ChessGame:
         self,
         chess_model: ChessModel,
         temperature: float = 1.0,
+        start_temperature: float = 1.0,
+        end_temperature: float = 0.05,
+        anneal_moves: int = 40,
         blunder_threshold: float = 0.15,
         is_self_play: bool = False,
         use_kv_cache: bool = False,
@@ -196,7 +201,14 @@ class ChessGame:
         """
         Args:
             chess_model:       shared ChessModel instance (weights + tokenizer + device).
-            temperature:       softmax temperature for move sampling; <1 = sharper, >1 = more random.
+            temperature:       softmax temperature for move sampling when is_self_play=False; <1 =
+                               sharper, >1 = more random. Ignored in self-play (replaced by the
+                               annealed schedule below).
+            start_temperature: self-play only — softmax temperature at move 0 (high = exploratory).
+            end_temperature:   self-play only — softmax temperature at anneal_moves and beyond
+                               (near-argmax = decisive).
+            anneal_moves:      self-play only — plies over which the temperature linearly anneals
+                               from start_temperature → end_temperature.
             blunder_threshold: max allowed value-head gap from the best candidate (in tanh-value units,
                                ~0.15 ≈ 60cp). Candidate moves with a larger gap are excluded before
                                picking. See MOVE_PICKING.md.
@@ -207,6 +219,9 @@ class ChessGame:
         """
         self.__chess_model = chess_model
         self.__temperature = temperature
+        self.__start_temperature = start_temperature
+        self.__end_temperature = end_temperature
+        self.__anneal_moves = anneal_moves
         self.__blunder_threshold = blunder_threshold
         self.__is_self_play = is_self_play
         self.__use_kv_cache = use_kv_cache
@@ -215,6 +230,14 @@ class ChessGame:
         self.__move_history = [chess_model.tokenizer.BOS]
         self.__kv_cache = KVCache()
         self.__kv_cache_tokens = 0
+
+    def _temperature_for(self, move_num: int) -> float:
+        """Self-play temperature schedule — linearly anneal start → end over the first anneal_moves plies."""
+        anneal_t = min(move_num / max(self.__anneal_moves, 1), 1.0)
+        return (
+            self.__start_temperature
+            + (self.__end_temperature - self.__start_temperature) * anneal_t
+        )
 
     @property
     def player_color(self) -> chess.Color | None:
@@ -225,10 +248,14 @@ class ChessGame:
         return self.__board
 
     def sample_move(self) -> chess.Move:
+        if self.__is_self_play:
+            temperature = self._temperature_for(len(self.__board.move_stack))
+        else:
+            temperature = self.__temperature
         move, new_cache = self.__chess_model.sample(
             board=self.__board,
             move_history=self.__move_history,
-            temperature=self.__temperature,
+            temperature=temperature,
             blunder_threshold=self.__blunder_threshold,
             is_self_play=self.__is_self_play,
             use_kv_cache=self.__use_kv_cache,

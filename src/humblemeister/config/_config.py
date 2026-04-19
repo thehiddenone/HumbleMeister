@@ -103,6 +103,13 @@ class ChessTrainingConfig:
     """Value-gap threshold for masking candidate moves during self-play (tanh-value units;
     0.25 ≈ 100 cp). Moves whose value score is more than this below the best candidate are
     excluded before the policy sample. See MOVE_PICKING.md."""
+    self_play_start_temperature: float = 1.0
+    """Softmax temperature for self-play policy sampling at move 0 (high = exploratory)."""
+    self_play_end_temperature: float = 0.05
+    """Softmax temperature at move self_play_anneal_moves and beyond (near-argmax = decisive)."""
+    self_play_anneal_moves: int = 40
+    """Number of plies over which the self-play temperature linearly anneals from
+    self_play_start_temperature down to self_play_end_temperature."""
     self_play_max_moves: int = 84  # hard draw cap for self-play games
     self_play_loss_mode: str = (
         SelfPlayLossMode.ADVANTAGE_WEIGHTED
