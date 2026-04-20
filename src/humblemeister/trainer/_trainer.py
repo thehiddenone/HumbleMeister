@@ -1003,10 +1003,16 @@ class ChessTrainer:
         for old in checkpoints[: -self.__config.keep_last_n]:
             old.unlink()
 
-    def __load_checkpoint_file(self, path: Path) -> dict[str, Any]:
-        """Load a checkpoint file into model/optimizer state, plus trainer-
-        side fields (``last_loss``, ``baseline_epoch``). ``baseline_epoch``
-        defaults to 0 for checkpoints written before the field existed.
+    def __load_checkpoint_file(self, path: Path, load_optimizer: bool = True) -> dict[str, Any]:
+        """Load a checkpoint file into model state, plus trainer-side fields
+        (``last_loss``, ``baseline_epoch``). ``baseline_epoch`` defaults to 0
+        for checkpoints written before the field existed.
+
+        When ``load_optimizer`` is False, the model weights are restored but
+        AdamW's first/second-moment buffers are left at their fresh-init
+        values. Used by the LR-restart path: the whole point of restarting
+        the schedule is to escape a decayed-LR + stale-momentum plateau, so
+        carrying the old optimizer state forward defeats the purpose.
         """
         checkpoint = torch.load(path, map_location=self.__device, weights_only=True)
 
@@ -1015,10 +1021,13 @@ class ChessTrainer:
             print(f"  initialized missing keys from scratch: {result.missing_keys}")
         if result.unexpected_keys:
             print(f"  ignored unexpected keys: {result.unexpected_keys}")
-        try:
-            self.__optimizer.load_state_dict(checkpoint["optimizer_state"])
-        except ValueError:
-            print("  optimizer state incompatible (model changed), starting optimizer fresh")
+        if load_optimizer:
+            try:
+                self.__optimizer.load_state_dict(checkpoint["optimizer_state"])
+            except ValueError:
+                print("  optimizer state incompatible (model changed), starting optimizer fresh")
+        else:
+            print("  optimizer state intentionally discarded (LR restart — fresh AdamW moments)")
         self.__last_loss = float(checkpoint["loss"])
         self.__baseline_epoch = int(checkpoint.get("baseline_epoch", 0))
 
@@ -1039,8 +1048,15 @@ class ChessTrainer:
         return self.__load_checkpoint_file(checkpoints[-1])
 
     def __load_checkpoint_at(self, epoch: int) -> dict[str, Any]:
-        """Load a specific checkpoint by epoch number. Raises if missing."""
+        """Load a specific checkpoint by epoch number for an LR restart.
+
+        Model weights are loaded but the optimizer state is intentionally
+        discarded — the caller (``run(from_checkpoint_epoch=...)``) is
+        restarting the schedule precisely because the old optimizer moments
+        are stale, so they must not carry over. Raises if the requested
+        checkpoint file is missing.
+        """
         path = self.__get_checkpoint_path(epoch)
         if not path.exists():
             raise RuntimeError(f"no checkpoint at epoch {epoch}: {path}")
-        return self.__load_checkpoint_file(path)
+        return self.__load_checkpoint_file(path, load_optimizer=False)
