@@ -169,6 +169,20 @@ class ChessTrainer:
             )
             print(f"model saved as pt: {path}")
 
+    def export_checkpoint(self, epoch: int, path: Path | None = None) -> None:
+        """Load the checkpoint at ``epoch`` and write it as a final model.
+
+        Loads checkpoint weights into the in-memory model, then delegates to
+        ``save_model`` (safetensors + config.json by default). Intended for
+        post-training use; modifies in-memory model state.
+        """
+        cp_path = self.__get_checkpoint_path(epoch)
+        if not cp_path.exists():
+            raise RuntimeError(f"no checkpoint at epoch {epoch}: {cp_path}")
+        checkpoint = torch.load(cp_path, map_location=self.__device, weights_only=True)
+        self.__model.load_state_dict(checkpoint["model_state"], strict=False)
+        self.save_model(path)
+
     @property
     def checkpoints_path(self) -> Path:
         return Path(self.__config.checkpoint_dir) / self.__config.model_name
